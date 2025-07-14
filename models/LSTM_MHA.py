@@ -5,6 +5,7 @@ from torch.nn.utils.parametrizations import weight_norm
 class CVAE(nn.Module):
     def __init__(self, d_model=256, latent_dim = 64, hidden_dim = 128):
         super().__init__()
+        self.latent_dim = latent_dim
         self.to_means = nn.Linear(d_model*42, latent_dim * 42)
         self.to_var = nn.Linear(d_model*42, latent_dim * 42)
         self.to_decoder = nn.Linear(latent_dim, d_model*2)
@@ -28,7 +29,7 @@ class CVAE(nn.Module):
         )
         self.smiles_embbed = nn.Embedding(dataset.vocab_size, d_model)
 
-        self.crossattn = MultiHeadAttention()
+        self.crossattn = MultiHeadAttention(d_model=latent_dim)
 
         self.input_embedding_p = nn.Sequential(
             nn.Linear(1, d_model // 2),

@@ -3,15 +3,15 @@ from torch.nn.utils.parametrizations import weight_norm
 class CVAE(nn.Module):
     def __init__(self, d_model=256, latent_dim = 64):
         super().__init__()
-        self.to_means = nn.Linear(d_model*42, latent_dim*42)
-        self.to_var = nn.Linear(d_model*42, latent_dim*42)
+        self.len = dataset.max_len+3
+        self.latent_dim = latent_dim
+        self.to_means = nn.Linear(d_model, latent_dim)
+        self.to_var = nn.Linear(d_model, latent_dim)
 
         self.encoder = TFEncoder()
-        self.decoder = TFDecoder()
-        self.to_prop = nn.Linear(42*64, 3)
-        self.to_prop_z = nn.Linear(42*64, 3)
-
-        self.crossattn = MultiHeadAttention()
+        self.decoder = TFDecoder(latent_dim=latent_dim)
+        self.to_prop = nn.Linear(self.len*latent_dim, 3)
+        self.to_prop_z = nn.Linear(self.len*latent_dim, 3)
 
         self.predict = nn.Linear(d_model, dataset.vocab_size)
 
@@ -22,8 +22,6 @@ class CVAE(nn.Module):
             nn.GELU(),
             nn.Linear(d_model // 4, d_model),
         )
-
-        self.pos_enc = PositionalEncoding(d_model // 8, dropout=0.2, max_len=5000)
         nn.init.constant_(self.to_var.bias, -3.0)
     
     def reparameterize(self, mu, log_var):
@@ -37,15 +35,15 @@ class CVAE(nn.Module):
 
         encoded = self.encoder(smiles_enc, properties_e)
 
-        means = self.to_means(encoded.view(B, -1))
-        log_var = self.to_var(encoded.view(B, -1))
+        means = self.to_means(encoded)
+        log_var = self.to_var(encoded)
         log_var = torch.clamp(log_var, min=-6., max=-2.2)
 
         z = self.reparameterize(means, log_var)
 
-        tgt = self.to_prop(means.view(-1, 42*64))
-        tgt_z = self.to_prop_z(z.view(-1, 42*64))
-        output = self.decoder(smiles_dec_input, z.view(-1, 42, 64))
+        tgt = self.to_prop(means.view(-1, self.len*self.latent_dim))
+        tgt_z = self.to_prop_z(z.view(-1, self.len*self.latent_dim))
+        output = self.decoder(smiles_dec_input, z)
         
 
         output = self.predict(output)
@@ -62,8 +60,10 @@ class PriorNet(nn.Module):
         latent_dim (int): Dimensionality of latent space.
         hidden_dim (int): Hidden size for MLP.
     """
-    def __init__(self, y_dim: int, latent_dim: int, hidden_dim: int = 256*42):
+    def __init__(self, y_dim: int, latent_dim: int, hidden_dim: int = 256):
         super().__init__()
+        self.len = dataset.max_len+3
+        self.hidden_dim = hidden_dim
         self.mlp = nn.Sequential(
             weight_norm(nn.Linear(y_dim, hidden_dim)),
             nn.GELU(),
@@ -72,11 +72,11 @@ class PriorNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.2),
-            weight_norm(nn.Linear(hidden_dim, hidden_dim)),
+            weight_norm(nn.Linear(hidden_dim, hidden_dim*self.len)),
             nn.GELU()
         )
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim*42)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim*42)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
         nn.init.constant_(self.fc_logvar.bias, -3.0)
 
     def forward(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,7 +91,8 @@ class PriorNet(nn.Module):
             logvar_p: Tensor of same shape
         """
         h = self.mlp(y)
-        mu = self.fc_mu(h)
-        lv = self.fc_logvar(h)
-        lv= torch.log1p(torch.exp(lv))-3.0
-        return mu, lv
+        mu = self.fc_mu(h.view(-1, self.len, self.hidden_dim))
+        lv = self.fc_logvar(h.view(-1, self.len, self.hidden_dim))
+        lv= torch.log1p(torch.exp(lv))
+        lv = torch.clamp(lv, 1e-4, 5.0)
+        return mu, lv.log()

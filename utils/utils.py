@@ -47,6 +47,17 @@ div.progress-bar {
 }
 </style>
 '''))
+from rdkit.Chem import rdmolops
+import selfies as sf   # polyselfies가 selfies를 패치해 설치해 줌
+
+
+def psmiles_to_pselfies(psmiles: str) -> str:
+    """PSMILES → SELFIES 변환 (★ 토큰 2개 강제)"""
+    if psmiles.count('*') != 2:
+        raise ValueError("PSMILES must contain exactly two '*' atoms")
+    # RDKit 에선 '*' 그대로 허용되므로 별도 치환 불필요
+    smi = psmiles.replace("[*]", "[At]").replace("*", "[At]")
+    return sf.encoder(smi)
 
 mm_scaler = MinMaxScaler()
 class load_data(Dataset):
@@ -103,6 +114,9 @@ class load_data(Dataset):
         self.std_vec  = meta["std_vec"]
         self.vocab_size = len(self.vocab)
         self.num_data   = self.SMILES_enc.shape[0]
+        print(self.vocab_size)
+    def split_selfies(self, sf_str):
+        return sf.split_selfies(sf_str)   # polyselfies가 내부 호출
 
     def _build_from_csv(self, path):
         #csv 읽기
@@ -114,7 +128,6 @@ class load_data(Dataset):
 
         #Li-ion Conductivity
         self.conductivity = self.raw.iloc[:, 6:7].values
-        self.conductivity = mm_scaler.fit_transform(self.conductivity.reshape(-1, 1))
         self.conductivity = log_minmax_pipeline.fit_transform(self.conductivity.reshape(-1, 1))
 
         #Degree of Polymerization
@@ -138,86 +151,47 @@ class load_data(Dataset):
         print(self.properties[:,1].mean())
         print(self.properties[:,2].mean())
 
-        #PSMILES 변환
-        psmiles = []
-        for smiles in self.SMILES:
-            ps = PS(smiles)
-            ps.canonicalize
-            psmiles.append(ps.psmiles)
+        #PSMILES 변환        
+        psmiles = [PS(smiles).canonicalize.psmiles for smiles in self.SMILES]
 
-        #Atom-In-SMILES Encoding
-        ais_encoding = []
-        for smiles in psmiles:
-            ais_encoding.append(atomInSmiles.encode(smiles))
-        
+        pselfies = [psmiles_to_pselfies(s) for s in psmiles]
 
-        #Atom-In-SMILES Tokenization (Encoder)
-        ais_tokens = []
-        for smiles in ais_encoding:
-            ais_tokens.append(atomInSmiles.smiles_tokenizer("[SOS] " + smiles +" [EOS]"))
+        sf_tokens = [list(self.split_selfies(sf)) for sf in pselfies]
 
-        max_len = len(max(ais_tokens, key=len)) + 1
-        self.max_len = max_len
-        print("max sequence length : ", max_len)
+        self.max_len = max(len(t) for t in sf_tokens) + 1
 
-        #vocab 구성
-        corpus = []
-        for frags in ais_tokens:
-            corpus.extend(frags)
-        corpus.append("[PAD]")
-        token_count = Counter(corpus)
-        vocab = { token:i for i, (token, count) in enumerate(sorted(token_count.items(), key=lambda x: x[1], reverse=True))}
+        # ③ vocab
+        corpus = [tok for seq in sf_tokens for tok in seq] + ["[SOS]","[EOS]","[PAD]"]
+        vocab  = {tok:i for i,tok in enumerate(sorted(set(corpus)))}
         vocab_size = len(vocab)
         
         self.vocab = vocab
 
-        num_data = len(ais_tokens)
+        num_data = len(sf_tokens)
         print(vocab)
 
-        ais_tokens_enc = ais_tokens
-        ais_tokens_enc = [[tok for tok in tokens if tok not in ['[SOS]', '[EOS]']] for tokens in ais_tokens_enc]
-
-        ais_tokens_dec_input = ais_tokens
-        ais_tokens_dec_input = [[tok for tok in tokens if tok not in ['[EOS]']] for tokens in ais_tokens_dec_input]
-
-        ais_tokens_dec_output = ais_tokens
-        ais_tokens_dec_output = [[tok for tok in tokens if tok not in ['[SOS]']] for tokens in ais_tokens_dec_output]
-
-        #Tokens to number (encoder)
-        ais_token_num_enc = torch.full((num_data, max_len),166, dtype=torch.long)
-        i=0
-        for tokens in ais_tokens_enc:
-            for length in range((len(tokens))):
-                ais_token_num_enc[i, length] = vocab[tokens[length]]
-            i += 1
-
-        #Tokens to number (Decoder Input)
-        ais_token_num_dec_input = torch.full((num_data, max_len),166, dtype=torch.long)
-        i=0
-        for tokens in ais_tokens_dec_input:
-            for length in range((len(tokens))):
-                ais_token_num_dec_input[i, length] = vocab[tokens[length]]
-            i += 1
-
-        #Tokens to number (Decoder Output)
-        ais_token_num_dec_output = torch.full((num_data, max_len),166, dtype=torch.long)
-        i=0
-        for tokens in ais_tokens_dec_output:
-            for length in range((len(tokens))):
-                ais_token_num_dec_output[i, length] = vocab[tokens[length]]
-            i += 1
-
-        dec_input_temp = torch.ones((6270, max_len+3),dtype=torch.long) + 165
-        dec_input_temp[:,:max_len]=ais_token_num_dec_input
-
-        dec_output_temp = torch.ones((6270, max_len+3),dtype=torch.long) + 165
-        dec_output_temp[:,:max_len]=ais_token_num_dec_output
+        enc   = torch.full((num_data, self.max_len), vocab["[PAD]"], dtype=torch.long)
+        dec_in= torch.full_like(enc, vocab["[PAD]"])
+        dec_out=torch.full_like(enc, vocab["[PAD]"])
 
 
-        self.SMILES_enc = ais_token_num_enc
-        self.SMILES_dec_input = dec_input_temp
-        self.SMILES_dec_output = dec_output_temp
+        for i, seq in enumerate(sf_tokens):
+            # Encoder = 순수 SELFIES
+            for j, tok in enumerate(seq):
+                enc[i,j] = vocab[tok]
 
+            # Decoder input = [SOS] + SELFIES
+            dec_in[i,0] = vocab["[SOS]"]
+            dec_in[i,1:len(seq)+1] = torch.tensor([vocab[t] for t in seq])
+
+            # Decoder output = SELFIES + [EOS]
+            dec_out[i,:len(seq)] = torch.tensor([vocab[t] for t in seq])
+            dec_out[i,len(seq)]  = vocab["[EOS]"]
+
+
+        self.SMILES_enc = enc
+        self.SMILES_dec_input = dec_in
+        self.SMILES_dec_output = dec_out
         vocab_size, num_data
         print("vocab size : ", vocab_size,"\nnumber of data : ",num_data)
         self.num_data = num_data
@@ -232,12 +206,12 @@ class load_data(Dataset):
 
         self.test_data = self.SMILES_enc[50]
 
-        print("PSMILES : ", psmiles[50])
-        print("After AIS encoding : ", ais_encoding[50])
-        print("After AIS Tokenization : ", ais_tokens_enc[50])
-        print("After to number : ", ais_token_num_enc[50])
+        print("PSMILES : ", pselfies[50])
+        print("After AIS encoding : ", enc[50])
+        print("After AIS Tokenization : ", enc[50])
+        print("After to number : ", enc[50])
         print("Properties : ",self.properties)
-        print(len(ais_token_num_enc[50]))
+        print(len(enc[50]))
         
     
     def __getitem__(self, i):
@@ -318,6 +292,9 @@ class load_data_LSTM(Dataset):
         self.vocab_size = len(self.vocab)
         self.num_data   = self.SMILES_enc.shape[0]
 
+    def split_selfies(self, sf_str):
+        return sf.split_selfies(sf_str)   # polyselfies가 내부 호출
+
     def _build_from_csv(self, path):
         #csv 읽기
         self.raw = pd.read_csv(path)
@@ -328,7 +305,6 @@ class load_data_LSTM(Dataset):
 
         #Li-ion Conductivity
         self.conductivity = self.raw.iloc[:, 6:7].values
-        self.conductivity = mm_scaler.fit_transform(self.conductivity.reshape(-1, 1))
         self.conductivity = log_minmax_pipeline.fit_transform(self.conductivity.reshape(-1, 1))
 
         #Degree of Polymerization
@@ -352,82 +328,47 @@ class load_data_LSTM(Dataset):
         print(self.properties[:,1].mean())
         print(self.properties[:,2].mean())
 
-        #PSMILES 변환
-        psmiles = []
-        for smiles in self.SMILES:
-            ps = PS(smiles)
-            ps.canonicalize
-            psmiles.append(ps.psmiles)
+        #PSMILES 변환        
+        psmiles = [PS(smiles).canonicalize.psmiles for smiles in self.SMILES]
 
-        #Atom-In-SMILES Encoding
-        ais_encoding = []
-        for smiles in psmiles:
-            ais_encoding.append(atomInSmiles.encode(smiles))
-        
+        pselfies = [psmiles_to_pselfies(s) for s in psmiles]
 
-        #Atom-In-SMILES Tokenization (Encoder)
-        ais_tokens = []
-        for smiles in ais_encoding:
-            ais_tokens.append(atomInSmiles.smiles_tokenizer("[SOS] " + smiles +" [EOS]"))
+        sf_tokens = [list(self.split_selfies(sf)) for sf in pselfies]
 
-        max_len = len(max(ais_tokens, key=len)) + 1
-        self.max_len = max_len
-        print("max sequence length : ", max_len)
+        self.max_len = max(len(t) for t in sf_tokens) + 1
 
-        #vocab 구성
-        corpus = []
-        for frags in ais_tokens:
-            corpus.extend(frags)
-        corpus.append("[PAD]")
-        token_count = Counter(corpus)
-        vocab = { token:i for i, (token, count) in enumerate(sorted(token_count.items(), key=lambda x: x[1], reverse=True))}
+        # ③ vocab
+        corpus = [tok for seq in sf_tokens for tok in seq] + ["[SOS]","[EOS]","[PAD]"]
+        vocab  = {tok:i for i,tok in enumerate(sorted(set(corpus)))}
         vocab_size = len(vocab)
         
         self.vocab = vocab
 
-        num_data = len(ais_tokens)
+        num_data = len(sf_tokens)
         print(vocab)
 
-        ais_tokens_enc = ais_tokens
-        ais_tokens_enc = [[tok for tok in tokens if tok not in ['[SOS]', '[EOS]']] for tokens in ais_tokens_enc]
-
-        ais_tokens_dec_input = ais_tokens
-        ais_tokens_dec_input = [[tok for tok in tokens if tok not in ['[EOS]']] for tokens in ais_tokens_dec_input]
-
-        ais_tokens_dec_output = ais_tokens
-        ais_tokens_dec_output = [[tok for tok in tokens if tok not in ['[SOS]']] for tokens in ais_tokens_dec_output]
-
-        #Tokens to number (encoder)
-        ais_token_num_enc = torch.full((num_data, max_len),166, dtype=torch.long)
-        i=0
-        for tokens in ais_tokens_enc:
-            for length in range((len(tokens))):
-                ais_token_num_enc[i, length] = vocab[tokens[length]]
-            i += 1
-
-        #Tokens to number (Decoder Input)
-        ais_token_num_dec_input = torch.full((num_data, max_len),166, dtype=torch.long)
-        i=0
-        for tokens in ais_tokens_dec_input:
-            for length in range((len(tokens))):
-                ais_token_num_dec_input[i, length] = vocab[tokens[length]]
-            i += 1
-
-        #Tokens to number (Decoder Output)
-        ais_token_num_dec_output = torch.full((num_data, max_len),166, dtype=torch.long)
-        i=0
-        for tokens in ais_tokens_dec_output:
-            for length in range((len(tokens))):
-                ais_token_num_dec_output[i, length] = vocab[tokens[length]]
-            i += 1
-
-        dec_output_temp = torch.ones((6270, max_len+3),dtype=torch.long) + 165
-        dec_output_temp[:,:max_len]=ais_token_num_dec_output
+        enc   = torch.full((num_data, self.max_len), vocab["[PAD]"], dtype=torch.long)
+        dec_in= torch.full_like(enc, vocab["[PAD]"])
+        dec_out=torch.full_like(enc, vocab["[PAD]"])
 
 
-        self.SMILES_enc = ais_token_num_enc
-        self.SMILES_dec_input = ais_token_num_dec_input
-        self.SMILES_dec_output = dec_output_temp
+        for i, seq in enumerate(sf_tokens):
+            # Encoder = 순수 SELFIES
+            for j, tok in enumerate(seq):
+                enc[i,j] = vocab[tok]
+
+            # Decoder input = [SOS] + SELFIES
+            dec_in[i,0] = vocab["[SOS]"]
+            dec_in[i,1:len(seq)+1] = torch.tensor([vocab[t] for t in seq])
+
+            # Decoder output = SELFIES + [EOS]
+            dec_out[i,:len(seq)] = torch.tensor([vocab[t] for t in seq])
+            dec_out[i,len(seq)]  = vocab["[EOS]"]
+
+
+        self.SMILES_enc = enc
+        self.SMILES_dec_input = dec_in
+        self.SMILES_dec_output = dec_out
 
         vocab_size, num_data
         print("vocab size : ", vocab_size,"\nnumber of data : ",num_data)
@@ -443,12 +384,12 @@ class load_data_LSTM(Dataset):
 
         self.test_data = self.SMILES_enc[50]
 
-        print("PSMILES : ", psmiles[50])
-        print("After AIS encoding : ", ais_encoding[50])
-        print("After AIS Tokenization : ", ais_tokens_enc[50])
-        print("After to number : ", ais_token_num_enc[50])
+        print("PSMILES : ", pselfies[50])
+        print("After AIS encoding : ", enc[50])
+        print("After AIS Tokenization : ", enc[50])
+        print("After to number : ", enc[50])
         print("Properties : ",self.properties)
-        print(len(ais_token_num_enc[50]))
+        print(len(enc[50]))
         
     
     def __getitem__(self, i):
@@ -469,6 +410,27 @@ train_dataloader_LSTM = DataLoader(train_dataset_LSTM, batch_size=256, shuffle=T
 val_dataloader_LSTM = DataLoader(val_dataset_LSTM, batch_size=256, shuffle=False, drop_last=False)
 
 eval_dataloader_LSTM = DataLoader(dataset_LSTM, batch_size=256, shuffle=False, drop_last=False)
+
+id2tok = {idx: token for token, idx in dataset.vocab.items()}
+def tok_ids_to_smiles(tok_ids):
+    """id 시퀀스 → (P)SMILES 문자열 (invalid 시 None)"""
+    tokens = [id2tok[i] for i in tok_ids]
+
+    # [EOS] 이후는 버림
+    if "[EOS]" in tokens:
+        tokens = tokens[:tokens.index("[EOS]")]
+
+    # SELFIES 문자열: 공백 없이 이어붙임
+    sf_str = "".join(tokens)
+
+    try:
+        smiles = sf.decoder(sf_str)
+        smiles = smiles.replace("At", "*")   # PSMILES 용도로 보려면
+    except Exception:
+        return None          # decoder 실패 → invalid
+
+    # RDKit validity 체크 (원한다면)
+    return smiles if Chem.MolFromSmiles(smiles) else None
 
 
 def reverse_one_hot_encoding(one_hot_tensor, vocab):
@@ -829,9 +791,11 @@ class ConditionalVAELoss(nn.Module):
         nce             : float = 0.02,    # Info NCE loss 가중
         sig_pen_q       : float = 0.003,   # Posterior Sigma Penalty 가중
         sig_pen_p       : float = 0.003,   # Prior Sigma Penalty 가중
-        imb             : float = 0.05     # imbalnace KLD 가중
+        imb             : float = 0.05,     # imbalnace KLD 가중
+        latent_dim      : int = 64
     ):
         super().__init__()
+        self.latent_dim = latent_dim
         self.V  = vocab_size
         self.fb = free_bits
         self.max_beta = max_beta
@@ -840,7 +804,7 @@ class ConditionalVAELoss(nn.Module):
         self.C_inc    = capacity_inc
         self.gamma    = gamma
         self.prop_w   = prop_w
-        self.proj = nn.Linear(3, 64*42)
+        self.proj = nn.Linear(3, self.latent_dim)
         self.nce      = nce
         self.sig_pen_q = sig_pen_q
         self.sig_pen_p = sig_pen_p
@@ -873,20 +837,21 @@ class ConditionalVAELoss(nn.Module):
         step:int
     ):
         B, L, _ = logits.size()
-        D       = mu_q.size(-1)
+        D       = self.latent_dim
 
         # 1) Reconstruction
         recon = F.cross_entropy(
             logits.reshape(-1, self.V),           # (B·L, V)
             target_tokens.view(-1),            # (B·L,)
             reduction='sum',
-            ignore_index=166
+            ignore_index=dataset.vocab['[PAD]']
         ) / B
 
         # 2) KL(q‖p)   -------------------------------------------------
         q = Normal(mu_q, torch.exp(0.5 * lv_q))
         p = Normal(mu_p, torch.exp(0.5 * lv_p))
         kld_dim = kl_divergence(q, p)               # (B, L, D)
+        kld_raw    = kld_dim.mean()                   # 모니터링용
 
         # 2-a) free-bits (per-dim clamp)
         if self.fb > 0.0:
@@ -895,17 +860,17 @@ class ConditionalVAELoss(nn.Module):
         kld_sample = kld_dim.sum(-1).mean()   # scalar – batch 평균
         kld_token = kld_dim
         kld_per_token = kld_token.mean()
-        kld_raw    = kld_dim.mean()                   # 모니터링용
+        
 
         # 2-b) KL term
         beta = min(self.max_beta, self.max_beta * step / self.anneal)
         kl_term = beta * kld_per_token
 
-        # if self.C_max > 0:          # Burgess Capacity-VAE 모드
-        #     C_t     = min(self.C_max, self.C_inc * step)
-        #     kl_term = self.gamma * F.relu(kld_sample - C_t)
-        # else:                       # 순수 β-VAE
-        #     kl_term = beta * kld_sample
+        if self.C_max > 0:          # Burgess Capacity-VAE 모드
+            C_t     = min(self.C_max, self.C_inc * step)
+            kl_term = self.gamma * F.relu(kld_sample - C_t)
+        else:                       # 순수 β-VAE
+            kl_term = beta * kld_sample
 
         # 3) Property losses ------------------------------------------
         prop_loss_mu = F.mse_loss(prop_pred_mu, true_prop)
@@ -915,7 +880,7 @@ class ConditionalVAELoss(nn.Module):
         # 4) InfoNCE
         cond = F.relu(self.proj.cuda().forward(true_prop.squeeze()))
         z = self.reparameterize(mu_q, lv_q)
-        info_nce = self.info_nce(z, cond)
+        info_nce = self.info_nce(z.mean(1), cond)
 
         imb = ((kld_dim - kld_dim.mean())**2).mean()
 
@@ -1067,11 +1032,11 @@ def decode_tokens(model, z, dec_in, properties):
     try: # Trans_MHA
         prop_p = model.input_embedding_p(properties)
         prop_p = model.pos_enc(prop_p)
-        z_z    = model.crossattn(z.view(-1, 42, 64), prop_p, prop_p)
+        z_z    = model.crossattn(z.view(-1, 42, 96), prop_p, prop_p)
         z_z    = model.ff(z_z)
         dec    = model.decoder(dec_in, z_z)
     except: # Trans
-        dec    = model.decoder(dec_in, z.view(-1, 42, 64))
+        dec    = model.decoder(dec_in, z.view(-1, 42, 96))
     return model.predict(dec)                  # [B, L, vocab]
 
 def log_px_z(logits, target):

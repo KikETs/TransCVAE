@@ -74,7 +74,7 @@ class TFEncoder(nn.Module):
         return encoded_0
 
 class TFDecoder(nn.Module):
-    def __init__(self, d_model=256, n_heads=4, d_ff=64, enc_seq_len=5000, dropout=0.4):
+    def __init__(self, d_model=256, n_heads=4, d_ff=64, enc_seq_len=5000, dropout=0.4, latent_dim=64):
         super().__init__()
         self.normLayer = LayerNorm(d_model=d_model)
         self.decoderLayer = TransformerDecoderLayer(batch_first=True,
@@ -86,7 +86,7 @@ class TFDecoder(nn.Module):
         self.decoder = TransformerDecoder(decoder_layer=self.decoderLayer,num_layers=2,
                                           norm=self.normLayer)        
         
-        self.to_memory = nn.Linear(64, d_model)
+        self.to_memory = nn.Linear(latent_dim, d_model)
         self.smi_embed = smi_emb
 
 
