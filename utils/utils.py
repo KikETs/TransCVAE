@@ -30,6 +30,20 @@ from sklearn.pipeline import Pipeline
 from sklearn.manifold import TSNE
 from matplotlib.colors import ListedColormap
 import umap.umap_ as umap
+from group_selfies.group_decoder import (
+    _tokenize_selfies, Counter,
+    selfies_to_graph_iterative, form_rings_bilocally_iterative
+)
+from group_selfies import(
+    fragment_mols,
+    Group,
+    MolecularGraph,
+    GroupGrammar,
+    group_encoder
+)
+from group_selfies.utils.selfies_utils import split_selfies
+
+ess = GroupGrammar.essential_set()
 
 log_transformer = FunctionTransformer(np.log1p, validate=True)
 log_minmax_pipeline = Pipeline(steps=[
@@ -49,15 +63,6 @@ div.progress-bar {
 '''))
 from rdkit.Chem import rdmolops
 import selfies as sf   # polyselfies가 selfies를 패치해 설치해 줌
-
-
-def psmiles_to_pselfies(psmiles: str) -> str:
-    """PSMILES → SELFIES 변환 (★ 토큰 2개 강제)"""
-    if psmiles.count('*') != 2:
-        raise ValueError("PSMILES must contain exactly two '*' atoms")
-    # RDKit 에선 '*' 그대로 허용되므로 별도 치환 불필요
-    smi = psmiles.replace("[*]", "[At]").replace("*", "[At]")
-    return sf.encoder(smi)
 
 mm_scaler = MinMaxScaler()
 class load_data(Dataset):
@@ -114,7 +119,11 @@ class load_data(Dataset):
         self.std_vec  = meta["std_vec"]
         self.vocab_size = len(self.vocab)
         self.num_data   = self.SMILES_enc.shape[0]
+        print(self.vocab)
         print(self.vocab_size)
+        print(self.SMILES_enc[0])
+        print(self.SMILES_dec_input[0])
+        print(self.SMILES_dec_output[0])
     def split_selfies(self, sf_str):
         return sf.split_selfies(sf_str)   # polyselfies가 내부 호출
 
@@ -154,9 +163,9 @@ class load_data(Dataset):
         #PSMILES 변환        
         psmiles = [PS(smiles).canonicalize.psmiles for smiles in self.SMILES]
 
-        pselfies = [psmiles_to_pselfies(s) for s in psmiles]
+        gpselfies = [ess.full_encoder(Chem.MolFromSmiles(s)) for s in psmiles]
 
-        sf_tokens = [list(self.split_selfies(sf)) for sf in pselfies]
+        sf_tokens = [list(split_selfies(sf)) for sf in gpselfies]
 
         self.max_len = max(len(t) for t in sf_tokens) + 1
 
@@ -206,7 +215,7 @@ class load_data(Dataset):
 
         self.test_data = self.SMILES_enc[50]
 
-        print("PSMILES : ", pselfies[50])
+        print("PSMILES : ", gpselfies[50])
         print("After AIS encoding : ", enc[50])
         print("After AIS Tokenization : ", enc[50])
         print("After to number : ", enc[50])
@@ -292,9 +301,6 @@ class load_data_LSTM(Dataset):
         self.vocab_size = len(self.vocab)
         self.num_data   = self.SMILES_enc.shape[0]
 
-    def split_selfies(self, sf_str):
-        return sf.split_selfies(sf_str)   # polyselfies가 내부 호출
-
     def _build_from_csv(self, path):
         #csv 읽기
         self.raw = pd.read_csv(path)
@@ -331,9 +337,9 @@ class load_data_LSTM(Dataset):
         #PSMILES 변환        
         psmiles = [PS(smiles).canonicalize.psmiles for smiles in self.SMILES]
 
-        pselfies = [psmiles_to_pselfies(s) for s in psmiles]
+        gpselfies = [ess.full_encoder(Chem.MolFromSmiles(s)) for s in psmiles]
 
-        sf_tokens = [list(self.split_selfies(sf)) for sf in pselfies]
+        sf_tokens = [list(split_selfies(sf)) for sf in gpselfies]
 
         self.max_len = max(len(t) for t in sf_tokens) + 1
 
@@ -384,7 +390,7 @@ class load_data_LSTM(Dataset):
 
         self.test_data = self.SMILES_enc[50]
 
-        print("PSMILES : ", pselfies[50])
+        print("PSMILES : ", gpselfies[50])
         print("After AIS encoding : ", enc[50])
         print("After AIS Tokenization : ", enc[50])
         print("After to number : ", enc[50])
@@ -411,26 +417,60 @@ val_dataloader_LSTM = DataLoader(val_dataset_LSTM, batch_size=256, shuffle=False
 
 eval_dataloader_LSTM = DataLoader(dataset_LSTM, batch_size=256, shuffle=False, drop_last=False)
 
+def decode_keep_star(grammar, selfies, sanitize=False, verbose=False):
+    """
+    Group SELFIES → RDKit Mol, but KEEP '*' dummy atoms (do not H-cap).
+    """
+    rings = []
+    place_from_idx = {}
+    inverse_place = []
+    dummy_counter = Counter(1)
+    group_atom = {}
+
+    mol = selfies_to_graph_iterative(
+        grammar=grammar,
+        symbol_iter=_tokenize_selfies(selfies),
+        selfies=selfies,
+        rings=rings,
+        dummy_counter=dummy_counter,
+        place_from_idx=place_from_idx,
+        inverse_place=inverse_place,
+        verbose=verbose,
+        group_atom=group_atom,
+    )
+    form_rings_bilocally_iterative(
+        mol, rings, place_from_idx, inverse_place,
+        dummy_counter, group_atom, verbose=verbose
+    )
+
+    res = mol.GetMol()  # convert RWMol→Mol
+    if sanitize:
+        # 기본 Sanitize는 '*'에도 대체로 안전하지만 필요시 제약 완화
+        Chem.SanitizeMol(res, sanitizeOps=Chem.SanitizeFlags.SANITIZE_NONE)
+    return res
+
 id2tok = {idx: token for token, idx in dataset.vocab.items()}
 def tok_ids_to_smiles(tok_ids):
-    """id 시퀀스 → (P)SMILES 문자열 (invalid 시 None)"""
-    tokens = [id2tok[i] for i in tok_ids]
-
-    # [EOS] 이후는 버림
+    tokens = [id2tok[i] for i in tok_ids]   
     if "[EOS]" in tokens:
         tokens = tokens[:tokens.index("[EOS]")]
-
-    # SELFIES 문자열: 공백 없이 이어붙임
     sf_str = "".join(tokens)
 
     try:
-        smiles = sf.decoder(sf_str)
-        smiles = smiles.replace("At", "*")   # PSMILES 용도로 보려면
+        smiles = decode_keep_star(ess, sf_str)
+        smiles = Chem.MolToSmiles(smiles)
     except Exception:
-        return None          # decoder 실패 → invalid
+        return None
 
-    # RDKit validity 체크 (원한다면)
-    return smiles if Chem.MolFromSmiles(smiles) else None
+    # 2) PSMILES canonicalize – 실패 시 원본 유지
+    try:
+        cand = PS(smiles).canonicalize.psmiles
+        if cand.count('*') == 2 and Chem.MolFromSmiles(cand):
+            smiles = cand
+    except Exception:
+        pass
+
+    return smiles
 
 
 def reverse_one_hot_encoding(one_hot_tensor, vocab):
@@ -782,6 +822,8 @@ class ConditionalVAELoss(nn.Module):
         self,
         vocab_size      : int,
         max_beta        : float = 1.0,     # β-VAE 상한
+        cyc_steps       : int   = 400,
+        num_cycles      : int   = 4,
         anneal_steps    : int   = 1000,    # β 스케줄 길이
         free_bits       : float = 0.02,    # per-dim nats
         capacity_max    : float = 0.0,     # 0이면 β-VAE, >0이면 Burgess-C
@@ -799,6 +841,8 @@ class ConditionalVAELoss(nn.Module):
         self.V  = vocab_size
         self.fb = free_bits
         self.max_beta = max_beta
+        self.cyc_steps = cyc_steps
+        self.num_cycles = num_cycles
         self.anneal   = anneal_steps
         self.C_max    = capacity_max
         self.C_inc    = capacity_inc
@@ -809,7 +853,13 @@ class ConditionalVAELoss(nn.Module):
         self.sig_pen_q = sig_pen_q
         self.sig_pen_p = sig_pen_p
         self.imb      = imb
-
+    def cyclical_beta(self, step: int, max_beta: float, cyc_steps: int, num_cycles: int) -> float:
+        """Triangular cyclical β schedule."""
+        cycle_idx = step // cyc_steps
+        if cycle_idx >= num_cycles:
+            return max_beta  # 이후엔 β 고정
+        pos = (step % cyc_steps) / cyc_steps  # 0→1 선형
+        return max_beta * pos
     def info_nce(self, z, y, temperature=0.2):
         """
         z : [B, d]  (posterior sample or mean)
@@ -850,44 +900,45 @@ class ConditionalVAELoss(nn.Module):
         # 2) KL(q‖p)   -------------------------------------------------
         q = Normal(mu_q, torch.exp(0.5 * lv_q))
         p = Normal(mu_p, torch.exp(0.5 * lv_p))
-        kld_dim = kl_divergence(q, p)               # (B, L, D)
-        kld_raw    = kld_dim.mean()                   # 모니터링용
+        kld_dim = torch.distributions.kl_divergence(q, p)  # (B, L, D)
 
-        # 2-a) free-bits (per-dim clamp)
+        # (1‑a) free‑bits (per‑dim clamp, 단위 = nat)
         if self.fb > 0.0:
             kld_dim = torch.clamp(kld_dim, min=self.fb)
 
-        kld_sample = kld_dim.sum(-1).mean()   # scalar – batch 평균
-        kld_token = kld_dim
-        kld_per_token = kld_token.mean()
-        
+        # (1‑b) 시퀀스·토큰 집계
+        kld_token = kld_dim.sum(-1)            # (B, L)  ← Σ_D
+        kld_seq   = kld_token.sum(-1)          # (B,)    ← Σ_L
 
-        # 2-b) KL term
-        beta = min(self.max_beta, self.max_beta * step / self.anneal)
+        raw_kld_seq   = kld_seq.mean()         # ⬅ 모니터링용  (nat / sequence)
+        kld_per_token = kld_token.mean()       # nat / 토큰  (BCE 비교용)
+
+        # ------------------------------------------------------------------
+        # 2) KL term (β‑VAE / cyclical β) ----------------------------------
+        beta = self.cyclical_beta(step, self.max_beta, self.cyc_steps, self.num_cycles)
+
+        # capacity OFF (C_max = 0) – pure β‑VAE
         kl_term = beta * kld_per_token
 
-        if self.C_max > 0:          # Burgess Capacity-VAE 모드
-            C_t     = min(self.C_max, self.C_inc * step)
-            kl_term = self.gamma * F.relu(kld_sample - C_t)
-        else:                       # 순수 β-VAE
-            kl_term = beta * kld_sample
-
-        # 3) Property losses ------------------------------------------
+        # ------------------------------------------------------------------
+        # 3) Property 회귀 손실 -------------------------------------------
         prop_loss_mu = F.mse_loss(prop_pred_mu, true_prop)
         prop_loss_z  = F.mse_loss(prop_pred_z , true_prop)
 
-    
-        # 4) InfoNCE
-        cond = F.relu(self.proj.cuda().forward(true_prop.squeeze()))
-        z = self.reparameterize(mu_q, lv_q)
+        # ------------------------------------------------------------------
+        # 4) InfoNCE -------------------------------------------------------
+        cond = F.relu(self.proj(true_prop.squeeze(-1)))      # (B, H)
+        z    = self.reparameterize(q.loc, q.scale.log())      # (B, L, D) → 모델 util 함수 가정
         info_nce = self.info_nce(z.mean(1), cond)
 
-        imb = ((kld_dim - kld_dim.mean())**2).mean()
+        # ------------------------------------------------------------------
+        # 5) Regularizers --------------------------------------------------
+        imb = ((kld_dim - kld_dim.mean()) ** 2).mean()
+        sig_pen_q = torch.exp(q.scale.log()).mean()
+        sig_pen_p = torch.exp(p.scale.log()).mean()
 
-        sig_pen_q = torch.exp(lv_q).mean()
-        sig_pen_p = torch.exp(lv_p).mean()
-
-        # 4) 최종 손실 -------------------------------------------------
+        # ------------------------------------------------------------------
+        # 6) 총 손실 -------------------------------------------------------
         loss = (
             recon
             + kl_term
@@ -898,7 +949,10 @@ class ConditionalVAELoss(nn.Module):
             + self.imb * imb
         )
 
-        return loss, recon, kld_sample, kld_raw, prop_loss_mu
+        # 모니터링 값들 리턴 ------------------------------------------------
+        return loss, recon,kl_term.detach(),raw_kld_seq.detach(),kld_per_token.detach(),prop_loss_mu.detach(),
+
+
 
 
 class ConditionalVAELoss_LSTM(nn.Module):

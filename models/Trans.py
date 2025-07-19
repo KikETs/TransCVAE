@@ -5,7 +5,12 @@ class CVAE(nn.Module):
         super().__init__()
         self.len = dataset.max_len+3
         self.latent_dim = latent_dim
-        self.to_means = nn.Linear(d_model, latent_dim)
+        mid=(d_model+latent_dim)//2
+        self.to_means = nn.Sequential(
+            nn.Linear(d_model, mid),
+            nn.Dropout(0.1),
+            nn.Linear(mid, latent_dim)
+        )
         self.to_var = nn.Linear(d_model, latent_dim)
 
         self.encoder = TFEncoder()
