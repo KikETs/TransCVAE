@@ -1,4 +1,11 @@
+from pathlib import Path
+import sys
+_THIS_FILE = Path(__file__).resolve()
+PROJECT_ROOT = _THIS_FILE.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
 from utils.Trans_util import *
+from utils.dataloader import dataset
 from torch.nn.utils.parametrizations import weight_norm
 class CVAE(nn.Module):
     def __init__(self, d_model=256, latent_dim = 64):
@@ -42,7 +49,6 @@ class CVAE(nn.Module):
 
         means = self.to_means(encoded)
         log_var = self.to_var(encoded)
-        log_var = torch.clamp(log_var, min=-6., max=-2.2)
 
         z = self.reparameterize(means, log_var)
 

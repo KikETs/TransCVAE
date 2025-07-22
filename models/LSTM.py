@@ -1,8 +1,9 @@
-import sys
-import random
 from pathlib import Path
-PROJECT_ROOT = Path.home()/"바탕화면"/"torch"/"Chem"
-sys.path.insert(0, str(PROJECT_ROOT))
+import sys
+_THIS_FILE = Path(__file__).resolve()
+PROJECT_ROOT = _THIS_FILE.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+from utils.dataloader import dataset
 from utils.LSTM_util import *
 import torch
 from torch.nn.utils.parametrizations import weight_norm

@@ -1,4 +1,5 @@
 from utils.Trans_util import *
+from utils.dataloader import dataset
 from torch.nn.utils.parametrizations import weight_norm
 class CVAE(nn.Module):
     def __init__(self, d_model=256, latent_dim = 64):

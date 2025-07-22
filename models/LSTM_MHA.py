@@ -1,5 +1,6 @@
 from utils.LSTM_util import *
 from utils.Trans_util import MultiHeadAttention
+from utils.dataloader import dataset
 from torch.nn.utils.parametrizations import weight_norm
 
 class CVAE(nn.Module):
