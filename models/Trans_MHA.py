@@ -3,10 +3,15 @@ from torch.nn.utils.parametrizations import weight_norm
 class CVAE(nn.Module):
     def __init__(self, d_model=256, latent_dim = 64):
         super().__init__()
-        self.latent_dim = latent_dim
         self.max_len = dataset.max_len+3
-        self.to_means = nn.Linear(d_model*self.max_len, latent_dim*self.max_len )
-        self.to_var = nn.Linear(d_model*self.max_len, latent_dim*self.max_len )
+        self.latent_dim = latent_dim
+        mid=(d_model+latent_dim)//2
+        self.to_means = nn.Sequential(
+            nn.Linear(d_model, mid),
+            nn.Dropout(0.1),
+            nn.Linear(mid, latent_dim)
+        )
+        self.to_var = nn.Linear(d_model, latent_dim)
         
 
         self.encoder = TFEncoder()
@@ -47,26 +52,25 @@ class CVAE(nn.Module):
         return mu + eps * std
 
     def forward(self, smiles_enc, smiles_dec_input, properties):
-        B = smiles_enc.size(0)
         properties_e = self.input_embedding(properties)
         properties_p = self.input_embedding_p(properties)
 
         encoded = self.encoder(smiles_enc, properties_e)
 
-        means = self.to_means(encoded.view(B, -1))
-        log_var = self.to_var(encoded.view(B, -1)).clamp_(max=-1)
+        means = self.to_means(encoded)
+        log_var = self.to_var(encoded).clamp_(max=-1)
 
         z = self.reparameterize(means, log_var)
 
         properties_p = self.pos_enc(properties_p)
         self.properties = properties_p
 
-        z_z = self.crossattn(z.view(B, self.max_len , self.latent_dim), properties_p, properties_p)
+        z_z = self.crossattn(z, properties_p, properties_p)
         z_z = self.norm1(self.ff(z_z))
 
 
-        tgt = self.to_prop(means)
-        tgt_z = self.to_prop_z(z)
+        tgt = self.to_prop(means.view(-1, self.max_len * self.latent_dim))
+        tgt_z = self.to_prop_z(z.view(-1, self.max_len * self.latent_dim))
         output = self.decoder(smiles_dec_input, z_z)
         
 
@@ -84,9 +88,10 @@ class PriorNet(nn.Module):
         latent_dim (int): Dimensionality of latent space.
         hidden_dim (int): Hidden size for MLP.
     """
-    def __init__(self, y_dim: int, latent_dim: int, hidden_dim: int = 256*(dataset.max_len+3)):
+    def __init__(self, y_dim: int, latent_dim: int, hidden_dim: int = 256):
         super().__init__()
-        self.max_len = dataset.max_len+3
+        self.len = dataset.max_len+3
+        self.hidden_dim = hidden_dim
         self.mlp = nn.Sequential(
             weight_norm(nn.Linear(y_dim, hidden_dim)),
             nn.GELU(),
@@ -95,11 +100,11 @@ class PriorNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.2),
-            weight_norm(nn.Linear(hidden_dim, hidden_dim)),
+            weight_norm(nn.Linear(hidden_dim, hidden_dim*self.len)),
             nn.GELU()
         )
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim*self.max_len)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim*self.max_len)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
         nn.init.constant_(self.fc_logvar.bias, -3.0)
 
     def forward(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -114,7 +119,8 @@ class PriorNet(nn.Module):
             logvar_p: Tensor of same shape
         """
         h = self.mlp(y)
-        mu = self.fc_mu(h)
-        lv = self.fc_logvar(h)
-        lv= torch.log1p(torch.exp(lv))-3.0
-        return mu, lv
+        mu = self.fc_mu(h.view(-1, self.len, self.hidden_dim))
+        lv = self.fc_logvar(h.view(-1, self.len, self.hidden_dim))
+        lv= torch.log1p(torch.exp(lv))
+        lv = torch.clamp(lv, 1e-4, 5.0)
+        return mu, lv.log()

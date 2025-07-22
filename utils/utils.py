@@ -960,6 +960,8 @@ class ConditionalVAELoss_LSTM(nn.Module):
         self,
         vocab_size      : int,
         max_beta        : float = 1.0,     # β-VAE 상한
+        cyc_steps       : int   = 400,
+        num_cycles      : int   = 4,
         anneal_steps    : int   = 1000,    # β 스케줄 길이
         free_bits       : float = 0.02,    # per-dim nats
         capacity_max    : float = 0.0,     # 0이면 β-VAE, >0이면 Burgess-C
@@ -969,23 +971,33 @@ class ConditionalVAELoss_LSTM(nn.Module):
         nce             : float = 0.02,    # Info NCE loss 가중
         sig_pen_q       : float = 0.003,   # Posterior Sigma Penalty 가중
         sig_pen_p       : float = 0.003,   # Prior Sigma Penalty 가중
-        imb             : float = 0.05     # imbalnace KLD 가중
+        imb             : float = 0.05,     # imbalnace KLD 가중
+        latent_dim      : int = 64
     ):
         super().__init__()
+        self.latent_dim = latent_dim
         self.V  = vocab_size
         self.fb = free_bits
         self.max_beta = max_beta
+        self.cyc_steps = cyc_steps
+        self.num_cycles = num_cycles
         self.anneal   = anneal_steps
         self.C_max    = capacity_max
         self.C_inc    = capacity_inc
         self.gamma    = gamma
         self.prop_w   = prop_w
-        self.proj = nn.Linear(3, 64)
+        self.proj = nn.Linear(3, self.latent_dim)
         self.nce      = nce
         self.sig_pen_q = sig_pen_q
         self.sig_pen_p = sig_pen_p
         self.imb      = imb
-
+    def cyclical_beta(self, step: int, max_beta: float, cyc_steps: int, num_cycles: int) -> float:
+        """Triangular cyclical β schedule."""
+        cycle_idx = step // cyc_steps
+        if cycle_idx >= num_cycles:
+            return max_beta  # 이후엔 β 고정
+        pos = (step % cyc_steps) / cyc_steps  # 0→1 선형
+        return max_beta * pos
     def info_nce(self, z, y, temperature=0.2):
         """
         z : [B, d]  (posterior sample or mean)
@@ -1013,55 +1025,58 @@ class ConditionalVAELoss_LSTM(nn.Module):
         step:int
     ):
         B, L, _ = logits.size()
-        D       = mu_q.size(-1)
+        D       = self.latent_dim
 
         # 1) Reconstruction
         recon = F.cross_entropy(
             logits.reshape(-1, self.V),           # (B·L, V)
             target_tokens.view(-1),            # (B·L,)
             reduction='sum',
+            ignore_index=dataset.vocab['[PAD]']
         ) / B
 
         # 2) KL(q‖p)   -------------------------------------------------
         q = Normal(mu_q, torch.exp(0.5 * lv_q))
         p = Normal(mu_p, torch.exp(0.5 * lv_p))
-        kld_dim = kl_divergence(q, p)               # (B, L, D)
+        kld_dim = torch.distributions.kl_divergence(q, p)  # (B, L, D)
 
-        # 2-a) free-bits (per-dim clamp)
+        # (1‑a) free‑bits (per‑dim clamp, 단위 = nat)
         if self.fb > 0.0:
             kld_dim = torch.clamp(kld_dim, min=self.fb)
 
-        kld_sample = kld_dim.sum(-1).sum(-1).mean()   # scalar – batch 평균
-        kld_token = kld_dim.sum(-1)
-        kld_per_token = kld_token.mean()
-        kld_raw    = kld_dim.mean()                   # 모니터링용
+        # (1‑b) 시퀀스·토큰 집계
+        kld_token = kld_dim.sum(-1)            # (B, L)  ← Σ_D
+        kld_seq   = kld_token.sum(-1)          # (B,)    ← Σ_L
 
-        # 2-b) KL term
-        beta = min(self.max_beta, self.max_beta * step / self.anneal)
+        raw_kld_seq   = kld_seq.mean()         # ⬅ 모니터링용  (nat / sequence)
+        kld_per_token = kld_token.mean()       # nat / 토큰  (BCE 비교용)
+
+        # ------------------------------------------------------------------
+        # 2) KL term (β‑VAE / cyclical β) ----------------------------------
+        beta = self.cyclical_beta(step, self.max_beta, self.cyc_steps, self.num_cycles)
+
+        # capacity OFF (C_max = 0) – pure β‑VAE
         kl_term = beta * kld_per_token
 
-        # if self.C_max > 0:          # Burgess Capacity-VAE 모드
-        #     C_t     = min(self.C_max, self.C_inc * step)
-        #     kl_term = self.gamma * F.relu(kld_sample - C_t)
-        # else:                       # 순수 β-VAE
-        #     kl_term = beta * kld_sample
-
-        # 3) Property losses ------------------------------------------
+        # ------------------------------------------------------------------
+        # 3) Property 회귀 손실 -------------------------------------------
         prop_loss_mu = F.mse_loss(prop_pred_mu, true_prop)
         prop_loss_z  = F.mse_loss(prop_pred_z , true_prop)
 
-    
-        # 4) InfoNCE
-        cond = F.relu(self.proj.cuda().forward(true_prop.squeeze()))
-        z = self.reparameterize(mu_q, lv_q)
+        # ------------------------------------------------------------------
+        # 4) InfoNCE -------------------------------------------------------
+        cond = F.relu(self.proj(true_prop.squeeze(-1)))      # (B, H)
+        z    = self.reparameterize(q.loc, q.scale.log())      # (B, L, D) → 모델 util 함수 가정
         info_nce = self.info_nce(z, cond)
 
-        imb = ((kld_dim - kld_dim.mean())**2).mean()
+        # ------------------------------------------------------------------
+        # 5) Regularizers --------------------------------------------------
+        imb = ((kld_dim - kld_dim.mean()) ** 2).mean()
+        sig_pen_q = torch.exp(q.scale.log()).mean()
+        sig_pen_p = torch.exp(p.scale.log()).mean()
 
-        sig_pen_q = torch.exp(lv_q).mean()
-        sig_pen_p = torch.exp(lv_p).mean()
-
-        # 4) 최종 손실 -------------------------------------------------
+        # ------------------------------------------------------------------
+        # 6) 총 손실 -------------------------------------------------------
         loss = (
             recon
             + kl_term
@@ -1072,7 +1087,10 @@ class ConditionalVAELoss_LSTM(nn.Module):
             + self.imb * imb
         )
 
-        return loss, recon, kld_sample, kld_raw, prop_loss_mu
+        # 모니터링 값들 리턴 ------------------------------------------------
+        return loss, recon,kl_term.detach(),raw_kld_seq.detach(),kld_per_token.detach(),prop_loss_mu.detach(),
+
+
 
 
 PAD_IDX = 166
