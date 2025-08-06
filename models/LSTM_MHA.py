@@ -35,9 +35,9 @@ class CVAE(nn.Module):
             nn.GELU()
         )
         self.smiles_embbed = nn.Embedding(dataset.vocab_size, d_model)
-
+        self.norm1 = nn.LayerNorm(latent_dim)
         self.crossattn = MultiHeadAttention(d_model=latent_dim)
-
+        self.alpha = nn.Parameter(torch.ones(1))
         self.input_embedding_p = nn.Sequential(
             nn.Linear(1, latent_dim // 2),
             nn.GELU(),
@@ -74,8 +74,9 @@ class CVAE(nn.Module):
 
         # ─── 2. Cross-Attention + FFN on z ─────────────────────────
         prop_p   = self.input_embedding_p(properties)             # [B,1,E′]
-        z_attn   = self.crossattn(z_sample, prop_p, prop_p)       # [B,L,z]
-        z_ff     = self.ff(z_attn)                                # [B,L,z]
+
+        z_z = self.alpha*self.crossattn(z_sample, prop_p, prop_p) + z_sample
+        z_ff = self.norm1(self.ff(z_z) + z_z)
 
         # ─── 3. 초기 (h0,c0)  — z_mean → 2*E  ─────────────────────
         z_mean   = z_ff.mean(1)                                   # [B,z]

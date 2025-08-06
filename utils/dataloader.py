@@ -1,8 +1,9 @@
 from utils.utils import *
 import sys, pathlib
 from pathlib import Path
-PROJECT_ROOT = Path.home()/"바탕화면"/"torch"/"Chem"
-sys.path.insert(0, str(PROJECT_ROOT))
+_THIS_FILE = Path(__file__).resolve()
+PROJECT_ROOT = _THIS_FILE.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 ess = GroupGrammar.essential_set()
 mm_scaler = MinMaxScaler()
 class load_data(Dataset):

@@ -1,3 +1,8 @@
+from pathlib import Path
+import sys
+_THIS_FILE = Path(__file__).resolve()
+PROJECT_ROOT = _THIS_FILE.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 from utils.Trans_util import *
 from utils.dataloader import dataset
 from torch.nn.utils.parametrizations import weight_norm
@@ -28,6 +33,7 @@ class CVAE(nn.Module):
             nn.Linear(1, latent_dim),
             nn.GELU()
         )
+        self.alpha = nn.Parameter(torch.ones(1))
 
         self.input_embedding = nn.Sequential(
             nn.Linear(1, d_model // 8),
@@ -52,27 +58,24 @@ class CVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, smiles_enc, smiles_dec_input, properties):
+    def forward(self, smiles_enc, smiles_dec_input, properties, enc_smi_mask=None, dec_smi_mask=None):
         properties_e = self.input_embedding(properties)
         properties_p = self.input_embedding_p(properties)
 
-        encoded = self.encoder(smiles_enc, properties_e)
+        encoded = self.encoder(smiles_enc, properties_e, enc_smi_mask)
 
         means = self.to_means(encoded)
-        log_var = self.to_var(encoded).clamp_(max=-1)
+        log_var = self.to_var(encoded).clamp_(max=0)
+        q = Normal(means, torch.exp(0.5 * log_var))
+        z = q.rsample()
 
-        z = self.reparameterize(means, log_var)
-
-        properties_p = self.pos_enc(properties_p)
-        self.properties = properties_p
-
-        z_z = self.crossattn(z, properties_p, properties_p)
-        z_z = self.norm1(self.ff(z_z))
+        z_z = self.alpha*self.crossattn(z, properties_p, properties_p) + z
+        z_z = self.norm1(self.ff(z_z) + z_z)
 
 
         tgt = self.to_prop(means.view(-1, self.max_len * self.latent_dim))
         tgt_z = self.to_prop_z(z.view(-1, self.max_len * self.latent_dim))
-        output = self.decoder(smiles_dec_input, z_z)
+        output = self.decoder(smiles_dec_input, z_z, enc_smi_mask)
         
 
         output = self.predict(output)

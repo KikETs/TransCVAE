@@ -102,6 +102,33 @@ def tok_ids_to_smiles(tok_ids, id2tok):
 
     return smiles
 
+def compute_ess(log_w: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Effective Sample Size (ESS) 계산
+    --------------------------------
+    log_w : (..., K)  IWAE 계산 시 나온 log 중요도 가중치
+    dim   : 샘플 축(K). 기본 = 마지막 차원
+    return: (...,)    배치마다 ESS
+    """
+    # double로 변환해 언더플로 완화
+    log_w = log_w.double()
+
+    # log Σ w   ,   log Σ w²   (안정적 log-sum-exp)
+    log_sum_w  = torch.logsumexp(log_w,       dim=dim)
+    log_sum_w2 = torch.logsumexp(2.0*log_w,   dim=dim)
+
+    # ESS = (Σ w)² / Σ w²  ≡  exp( 2·logΣw - logΣw² )
+    ess = torch.exp(2.0 * log_sum_w - log_sum_w2)
+    return ess
 
 
-
+def make_src_key_padding_mask(lengths: torch.Tensor, max_len: int | None = None):
+    """
+    lengths: (batch,) 각 시퀀스의 실제 길이
+    return : (batch, max_len) True=PAD, False=valid
+    """
+    if max_len is None:
+        max_len = lengths.max().item()
+    range_row = torch.arange(max_len, device=lengths.device).unsqueeze(0)  # (1, max_len)
+    mask = range_row >= lengths.unsqueeze(1)                               # (batch, max_len)
+    return mask

@@ -36,16 +36,15 @@ class CVAE(nn.Module):
         )
         nn.init.constant_(self.to_var.bias, -3.0)
     
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+    def reparameterize(self, mu, lv):
+        q = Normal(mu, (0.5 * lv).exp())
+        return q.rsample()
 
-    def forward(self, smiles_enc, smiles_dec_input, properties):
+    def forward(self, smiles_enc, smiles_dec_input, properties, enc_smi_mask = None, dec_smi_mask = None):
         B = smiles_enc.size(0)
         properties_e = self.input_embedding(properties)
 
-        encoded = self.encoder(smiles_enc, properties_e)
+        encoded = self.encoder(smiles_enc, properties_e, enc_smi_mask)
 
         means = self.to_means(encoded)
         log_var = self.to_var(encoded)
@@ -54,7 +53,7 @@ class CVAE(nn.Module):
 
         tgt = self.to_prop(means.view(-1, self.len*self.latent_dim))
         tgt_z = self.to_prop_z(z.view(-1, self.len*self.latent_dim))
-        output = self.decoder(smiles_dec_input, z)
+        output = self.decoder(smiles_dec_input, z, enc_smi_mask)
         
 
         output = self.predict(output)

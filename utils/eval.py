@@ -24,27 +24,10 @@ def log_px_z(logits, target):
     )
     return ll.sum(dim=1)                       # [B]
 
-def decode_tokens_LSTM(model, z, dec_in, properties):
-    prop_p = model.input_embedding_p(properties)
-    try: # LSTM_MHA
-        z_z    = model.crossattn(z, prop_p, prop_p)
-        z_z    = model.ff(z_z)
-        dec    = model.decoder(dec_in, z_z)
-    except: # LSTM
-        dec    = model.decoder(dec_in, z_z)
-    return model.predict(dec)                  # [B, L, vocab]
-
-def log_px_z(logits, target):
-    ll = -F.cross_entropy(
-        logits.transpose(1, 2), target,
-        reduction='none', ignore_index=PAD_IDX
-    )
-    return ll.sum(dim=1)                       # [B]
-
 
 @torch.inference_mode()
 def iwae_bound(
-        model, prior,
+        model,
         sm_enc, sm_dec_in, sm_dec_tgt, props,
         K=64, chunk=8, pad_idx=0):
 
@@ -53,12 +36,12 @@ def iwae_bound(
     mu_q, lv_q = model.to_means(enc), model.to_var(enc)
     q     = Normal(mu_q, (0.5 * lv_q).exp())
 
-    mu_p, lv_p = prior(props.squeeze())
+    mu_p, lv_p = model.prior(props.squeeze())
     p     = Normal(mu_p, (0.5 * lv_p).exp())
 
     log_ws = []
 
-    with torch.no_grad(), torch.amp.autocast(device_type='cuda'):   # ③+④
+    with torch.no_grad():   # ③+④
         for k0 in range(0, K, chunk):
             k_eff = min(chunk, K - k0)
 
@@ -91,7 +74,7 @@ def iwae_bound(
     log_ws = torch.cat(log_ws, dim=0)                 # [K,B]
     logw_max = log_ws.max(0, keepdim=True).values
     iwae = logw_max + (log_ws - logw_max).exp().mean(0).log()
-    return iwae                                       # [B]
+    return iwae, log_ws
 
 @torch.no_grad()
 def kl_decompose_minibatch(mu_b, lv_b, dataset_size):
@@ -230,7 +213,7 @@ def iwae_bound_lstm_MHA(model,                # LSTM-CVAE (cross-attn)
     # 3. Importance-weighted 샘플링
     # ────────────────────────────────────────────────────────────────────
     log_ws = []
-    with torch.no_grad(), amp_ctx:
+    with torch.no_grad():
         for k0 in range(0, K, chunk):
             k_eff = min(chunk, K - k0)
 
@@ -268,7 +251,7 @@ def iwae_bound_lstm_MHA(model,                # LSTM-CVAE (cross-attn)
     logw_max = log_ws.max(0, keepdim=True).values
     iwae     = logw_max + (log_ws - logw_max).exp().mean(0).log()  # [B]
 
-    return iwae
+    return iwae, log_ws
 
 # ─────────────────────────────
 # z → (h0,c0) → 디코더 → logits
@@ -321,7 +304,7 @@ def iwae_bound_lstm(model,                # LSTM-CVAE
 
     # ─── 3. Importance-weighted 샘플 ───────────────────────
     log_ws = []
-    with torch.no_grad(), amp_ctx:
+    with torch.no_grad():
         for k0 in range(0, K, chunk):
             k_eff = min(chunk, K - k0)
 
@@ -356,7 +339,7 @@ def iwae_bound_lstm(model,                # LSTM-CVAE
     logw_max = log_ws.max(0, keepdim=True).values
     iwae     = logw_max + (log_ws - logw_max).exp().mean(0).log()  # [B]
 
-    return iwae
+    return iwae, log_ws
 
 
 
@@ -427,7 +410,8 @@ def _beam_search_decode(model, z, sos_id: int, eos_id: int, *,
 #####################################################################
 # Reconstruction with z = μ  (greedy or beam)
 #####################################################################
-
+vocab = dataset.vocab
+index_to_token = {idx: token for token, idx in vocab.items()}
 def reconstruct_zmu(model, dataloader, vocab: dict, *,
                      beam_width: int = 1, len_penalty: float = 1.0,
                      max_len: int | None = None,
@@ -435,19 +419,20 @@ def reconstruct_zmu(model, dataloader, vocab: dict, *,
                      alpha: float = 0.7):
     """Return (mean_tanimoto, num_pairs). beam_width=1 → greedy."""
     model.eval()
-    model.cpu()
+    model.cuda()
     tanis, pairs = [], 0
     device = next(model.parameters()).device
 
     SOS, EOS, PAD = vocab['[SOS]'], vocab['[EOS]'], vocab['[PAD]']
     if max_len is None:
-        max_len = 128
+        max_len = dataset.max_len+3
 
     for enc_in, _, _, props in dataloader:
         enc_in, props = enc_in.to(device), props.to(device)
+        smi_mask = make_src_key_padding_mask(enc_in==dataset.vocab['[PAD]']).to(device).squeeze()
         with torch.no_grad():
             prop_e  = model.input_embedding(props)
-            encoded = model.encoder(enc_in, prop_e)
+            encoded = model.encoder(enc_in, prop_e, smi_mask)
             mu_q    = model.to_means(encoded)
             z       = mu_q  # z = μ
 
@@ -480,9 +465,56 @@ def reconstruct_zmu(model, dataloader, vocab: dict, *,
                                               alpha=alpha)
         # SELFIES → SMILES & Tanimoto ----------------------------------------
         for r_tok, o_tok in zip(enc_in.cpu().tolist(), out_tok):
-            ref_sm = tok_ids_to_smiles([t for t in r_tok if t not in (PAD,)])
-            out_sm = tok_ids_to_smiles([t for t in o_tok if t not in (PAD,)])
+            ref_sm = tok_ids_to_smiles([t for t in r_tok if t not in (PAD,)], index_to_token)
+            out_sm = tok_ids_to_smiles([t for t in o_tok if t not in (PAD,)], index_to_token)
             if ref_sm and out_sm:
                 tanis.append(tanimoto(ref_sm, out_sm))
                 pairs += 1
     return np.mean(tanis) if tanis else 0.0, pairs
+
+def eval_iwae_bound(model, prior, sm_enc, sm_dec_in, sm_dec_out, prop, smi_mask, K=64, chunk=8):
+    model.eval()
+    # 1) build q,p
+    enc = model.encoder(sm_enc, model.input_embedding(prop), smi_mask)
+    mu_q, lv_q = model.to_means(enc), model.to_var(enc)
+    q = Normal(mu_q, (0.5 * lv_q).exp())
+
+    mu_p, lv_p = prior(prop.squeeze())
+    p = Normal(mu_p, (0.5 * lv_p).exp())
+
+    # 2) chunked sampling
+    log_ws = []
+    B = sm_enc.size(0)
+    for k0 in range(0, K, chunk):
+        k = min(chunk, K - k0)
+        z = q.rsample((k,))                             # [k,B,L,D]
+        z2 = z.view(k * B, *z.shape[2:])
+
+        # log p(x|z)
+        logits = model.predict(model.decoder(sm_dec_in.repeat(k,1), z2))
+        logp   = torch.log_softmax(logits, dim=-1)
+        ll     = logp.gather(-1,
+                    sm_dec_out.repeat(k,1).unsqueeze(-1)
+                 ).squeeze(-1)
+        ll.masked_fill_(sm_dec_out.repeat(k,1)==dataset.vocab['[PAD]'], 0.)
+        log_px = ll.sum(-1).view(k, B)                  # [k,B]
+
+        # log p(z), log q(z|x)
+        rd = tuple(range(2, z.dim()))
+        log_qz = q.log_prob(z).sum(rd)                  # [k,B]
+        log_pz = p.log_prob(z).sum(rd)                  # [k,B]
+
+        log_ws.append(log_px + log_pz - log_qz)         # <— no β, no clamp
+
+    log_ws = torch.cat(log_ws, 0).double()                       # (K,B)
+
+    # 3) IWAE bound
+    m    = log_ws.max(0, keepdim=True).values          # (1,B)
+    iwae = (m + (log_ws - m).exp().mean(0).log()).squeeze(0)  # (B,)
+
+    # 4) ESS
+    w = (log_ws - m).exp()
+    w = w / w.sum(0, keepdim=True)
+    ess = (w.sum(0)**2 / (w**2).sum(0)).mean().item()
+
+    return iwae.mean().item(), ess

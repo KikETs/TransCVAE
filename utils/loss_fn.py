@@ -273,3 +273,68 @@ class ConditionalVAELoss_LSTM(nn.Module):
         # 모니터링 값들 리턴 ------------------------------------------------
         return loss, recon,kl_term.detach(),raw_kld_seq.detach(),kld_per_token.detach(),prop_loss_mu.detach(),
 
+class IWAEPropertyLoss(nn.Module):
+    def __init__(self, prop_w=1.0, nce=0.02,
+                 sig_pen_q=0.003, sig_pen_p=0.003, imb=0.05,
+                 latent_dim=64):
+        super().__init__()
+        self.prop_w   = prop_w
+        self.nce_w    = nce
+        self.sig_pen_q= sig_pen_q
+        self.sig_pen_p= sig_pen_p
+        self.imb_w    = imb
+        self.proj     = nn.Linear(3, latent_dim)
+
+    @staticmethod
+    def info_nce(z,y,T=0.5):
+        z = F.normalize(z, -1);  y = F.normalize(y, -1)
+        logits = z @ y.t() / T
+        return F.cross_entropy(logits,
+                               torch.arange(z.size(0), device=z.device))
+
+    def forward(self, iw_term,      # -iwae.mean()
+                      mu_q, lv_q,
+                      mu_p, lv_p,
+                      prop_pred_mu, true_prop, log_ws:torch.Tensor):
+        # 1) 물성 손실
+        prop_loss = F.mse_loss(prop_pred_mu, true_prop)
+
+        # 2) InfoNCE (posterior mean 사용)
+        cond = F.relu(self.proj(true_prop))
+        z_mu = mu_q.mean(1)                   # (B,D)
+        #nce  = self.info_nce(z_mu, cond)
+
+        # 3) 추가 규제
+        q = Normal(mu_q, (0.5*lv_q).exp())
+        p = Normal(mu_p, (0.5*lv_p).exp())
+        sig_pen_q = q.scale.mean()
+        sig_pen_p = p.scale.mean()
+        imb = ((lv_q - lv_q.mean())**2).mean()
+
+        target_std = 0.30        # 원하는 μ std
+        mu_center  = mu_q.mean(dim=(-2,-1), keepdim=True)
+        mu_var     = ((mu_q - mu_center)**2).mean((-2,-1))   # (B,)
+        sigma_q = torch.exp(0.5 * lv_q)
+        upper_pen = F.relu(sigma_q - 0.7).mean()
+        lower_pen = F.relu(0.5 - sigma_q).mean()
+        mu_var_pen    = F.relu(target_std**2 - mu_var).mean()   # μ std가 목표보다 작을 때만 >0
+
+        w = (log_ws - log_ws.max(0)[0]).exp()
+        w_n = w / w.sum(0, keepdim=True)
+        ess_est = 1.0 / (w_n**2).sum(0)
+        ess_pen_min = (F.relu(8.0 - ess_est).mean())**2
+        ess_pen_max = (F.relu(ess_est - 18.0).mean())**2
+        ess_pen = ess_pen_max + ess_pen_min
+
+        # 4) 총 손실
+        loss = (-iw_term.mean()
+                + self.prop_w * prop_loss
+                #+ self.nce_w  * nce
+                + self.sig_pen_q * sig_pen_q
+                + self.sig_pen_p * sig_pen_p
+                + self.imb_w * imb
+                + 1e-3 * mu_var_pen
+                + 1 * (upper_pen+lower_pen)
+                + 1e+2 * ess_pen)
+
+        return loss, prop_loss, imb

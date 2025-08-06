@@ -1,86 +1,83 @@
 from utils.utils import *
-
+from torch.nn.utils.rnn import pad_sequence
 def generate_batch_sequence(
     model,
     z,
-    max_length=265,
-    start_token=None,
-    end_token=None,
-    fixed_seq_len=None,
-    pad_token=None,
-    device='cuda'
+    max_length: int,
+    start_token: int,
+    end_token: int,
+    pad_token: int,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    device: str = "cuda",
 ):
     """
-    Batch-aware autoregressive generation without temperature scaling,
-    top-k / top-p filtering, or fallback re-normalisation.
-
-    Args
-    ----
-    decoder : nn.Module
-        Autoregressive Transformer decoder.
-    z : torch.Tensor
-        Latent tensor of shape [B, seq_len, embed_dim].
-    max_length : int
-        Maximum number of tokens to generate (inclusive of <end>).
-    start_token : int
-        Token ID to place at the beginning of every sequence.
-    end_token : int
-        Generation stops for a sequence when this ID is produced.
-    fixed_seq_len : int | None
-        Context window length fed to the decoder each step.
-        If None, defaults to `z.size(1)`.
-    pad_token : int | None
-        Token used to left-pad the context when it is shorter than
-        `fixed_seq_len`.
-    device : str
-        CUDA / CPU device string.
+    Autoregressive generation that *keeps* the whole history.
+    ※ z 길이(encoder memory)는 건드리지 않는다.
     """
 
-    decoder = model.decoder
+    model.eval()
+
     B = z.size(0)
     z = z.to(device)
 
-    if fixed_seq_len is None:
-        fixed_seq_len = z.size(1)
-
-    # initialise each sequence with <start>
-    generated = [[start_token] for _ in range(B)]
+    # 각 배치마다 시퀀스 초기화
+    generated: list[list[int]] = [[start_token] for _ in range(B)]
     finished = [False] * B
 
     for _ in range(max_length):
-        # prepare fixed-length contexts
-        x_in = [
-            (seq + [pad_token] * (fixed_seq_len - len(seq)))[:fixed_seq_len]
-            if len(seq) < fixed_seq_len
-            else seq[-fixed_seq_len:]
-            for seq in generated
-        ]
-        x_in = torch.tensor(x_in, dtype=torch.long, device=device)  # [B, L]
+        # ── 1) padding-right 로 맞춰서 텐서화 ─────────────────────────
+        cur_len = max(len(seq) for seq in generated)
+        seq_tensor = torch.full(
+            (B, cur_len), pad_token, dtype=torch.long, device=device
+        )
+        seq_lens = []
+        for i, seq in enumerate(generated):
+            seq_lens.append(len(seq))
+            seq_tensor[i, : len(seq)] = torch.tensor(seq, device=device)
 
-        # forward pass (single batch)
+
+        # ── 3) forward ──────────────────────────────────────────────
         with torch.no_grad():
-            logits = decoder(x_in, z)          # [B, L, V]
-            logits = model.predict(logits)     # [B, L, V]
+            logits = model.decoder(
+                seq_tensor,
+                z,  # z 길이 그대로
+            )
+            logits = model.predict(logits) / temperature  # [B, cur_len, V]
 
+        # ── 4) 마지막 위치의 로짓만 뽑아서 샘플링 ────────────────────
+        last_pos = torch.tensor([l - 1 for l in seq_lens], device=device)
+        next_logits = logits[torch.arange(B, device=device), last_pos]  # [B, V]
+
+        # ··· top-k · top-p 필터링(Optional) ···
+        if top_k is not None:
+            topk_val, _ = torch.topk(next_logits, top_k)
+            threshold = topk_val[:, -1, None]
+            next_logits[next_logits < threshold] = -float("inf")
+
+        if top_p is not None:
+            sorted_logits, sorted_idx = torch.sort(next_logits, dim=-1, descending=True)
+            probs = F.softmax(sorted_logits, dim=-1)
+            cumulative = probs.cumsum(dim=-1)
+            mask = cumulative > top_p
+            mask[..., 0] = False
+            sorted_logits[mask] = -float("inf")
+            next_logits.scatter_(1, sorted_idx, sorted_logits)
+
+        probs = F.softmax(next_logits, dim=-1)
+
+        # ── 5) 토큰 선택 & 종료 체크 ─────────────────────────────────
         all_done = True
         for i in range(B):
             if finished[i]:
                 continue
-            all_done = False
-
-            pos = min(len(generated[i]) - 1, fixed_seq_len - 1)
-            next_logits = logits[i, pos, :]  # [V]
-
-            # convert to probabilities
-            probs = F.softmax(next_logits, dim=-1)
-
-            # sample next token
-            tok = torch.multinomial(probs, 1).item()
+            tok = torch.multinomial(probs[i], 1).item()
             generated[i].append(tok)
-
-            # stop if <end>
             if tok == end_token:
                 finished[i] = True
+            else:
+                all_done = False
 
         if all_done:
             break
@@ -90,170 +87,210 @@ def generate_batch_sequence(
 @torch.no_grad()
 def generate_batch_sequence_LSTM(
     model,
-    z,                         # [B, latent_dim]
-    max_length     = 42,
-    start_token    = None,
-    end_token      = None,
-    pad_token      = None,     # 완성된 뒤 채우고 싶을 때만 사용
-    grammar_mask_fn= None,     # build_grammar_mask 등
-    index_to_token = None,     # ID → 문자 매핑 (grammar mask용)
-    device         = "cuda",
+    z,                           # [B, latent_dim]
+    max_length: int,
+    start_token: int,
+    end_token: int,
+    pad_token: int | None = None,
+    grammar_mask_fn=None,
+    index_to_token=None,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    device: str = "cuda",
 ):
     """
-    Batch-wise autoregressive generation for the LSTM-CVAE decoder.
+    LSTM-CVAE 배치 생성 (시퀀스 누적 방식)
 
-    * 한 스텝에 <현재 토큰 1개>씩 넣어 hidden-state를 이어받으며 생성합니다.
-    * z → (h0, c0) 초기화는 모델 내부의 `to_decoder` 선형층 로직을 그대로 사용합니다.
-    * grammar_mask_fn 이 주어지면 매 스텝마다 (배치별) 허용 토큰을 필터링합니다.
+    * hidden-state를 이어받으면서도, 매 스텝마다
+      지금까지 만든 전체 시퀀스(패딩 포함)를 LSTM에 넣어도 OK.
+    * top-k / top-p / temperature 지원.
     """
 
     model = model.to(device).eval()
     B     = z.size(0)
     z     = z.to(device)
 
-    # ------------------------------------------------------------------
-    # 1) z   →   초기 hidden-state (층 반복 포함)
-    # ------------------------------------------------------------------
-    h0_raw, c0_raw = torch.tanh(model.to_decoder(z)).chunk(2, dim=-1)   #  [B, d_model] 두 조각
-    num_layers     = model.decoder.num_layers                            # 2 층 LSTM
-    h              = h0_raw.unsqueeze(0).repeat(num_layers, 1, 1).contiguous()  # [L,B,d]
-    c              = c0_raw.unsqueeze(0).repeat(num_layers, 1, 1).contiguous()
+    # ── 1) z → (h0, c0) 초기화 ─────────────────────────────────────
+    h0_raw, c0_raw = torch.tanh(model.to_decoder(z)).chunk(2, dim=-1)  # [B,d]
+    num_layers     = model.decoder.num_layers
+    h = h0_raw.unsqueeze(0).repeat(num_layers, 1, 1).contiguous()
+    c = c0_raw.unsqueeze(0).repeat(num_layers, 1, 1).contiguous()
 
-    # ------------------------------------------------------------------
-    # 2) <SOS> 토큰으로 시작
-    # ------------------------------------------------------------------
+    # ── 2) 시퀀스 시작 ────────────────────────────────────────────
     generated = [[start_token] for _ in range(B)]
-    cur_tok   = torch.full((B,), start_token, dtype=torch.long, device=device)
     finished  = [False] * B
 
-    # ------------------------------------------------------------------
-    # 3) 토큰 한 개씩 autoregressive 루프
-    # ------------------------------------------------------------------
-    for _ in range(max_length - 1):          # 이미 <SOS> 하나는 넣었으므로 −1
-        # (a) 토큰 → 임베딩  (shape [B,1,d_model])
-        emb = model.smiles_embbed(cur_tok).unsqueeze(1)
+    # ── 3) 오토리그레시브 루프 ──────────────────────────────────
+    for _ in range(max_length - 1):  # <SOS> 포함했으니 −1
+        # (a) 배치에서 가장 긴 길이 기준으로 패딩-오른쪽 정렬
+        cur_len = max(len(seq) for seq in generated)
+        seq_tensor = torch.full(
+            (B, cur_len), pad_token, dtype=torch.long, device=device
+        )
+        for i, seq in enumerate(generated):
+            seq_tensor[i, : len(seq)] = torch.tensor(seq, device=device)
 
-        # (b) LSTM 디코더 전진
-        out, (h, c) = model.decoder(emb, (h, c))   # out: [B,1,d_model]
-        logits = model.predict(out.squeeze(1))     # [B, vocab]
+        # (b) 토큰 임베딩 & LSTM 통과
+        emb = model.smiles_embbed(seq_tensor)           # [B, cur_len, d]
+        out, (h, c) = model.decoder(emb, (h, c))        # hidden 이어받음
+        logits      = model.predict(out[:, -1]) / temperature  # 마지막 토큰만
 
-        # (c) 배치별 다음 토큰 샘플링
-        next_tok_list = []
+        # (c) 배치별 next-token 결정
+        next_tok = []
         for i in range(B):
             if finished[i]:
-                # 이미 <EOS>를 낸 시퀀스는 pad_token(또는 end_token)으로만 채움
-                next_tok_list.append(pad_token if pad_token is not None else end_token)
+                next_tok.append(pad_token)
                 continue
 
             logit_i = logits[i]
 
-            # grammar mask 적용(선택)
+            # grammar mask (선택)
             if grammar_mask_fn is not None:
                 mask = grammar_mask_fn(
                     generated[i], index_to_token, logit_i.size(0)
                 ).to(device)
                 logit_i = logit_i.masked_fill(~mask, -1e9)
 
-            # 확률화 & 샘플링
-            prob_i = F.softmax(logit_i, dim=-1)
-            tok    = torch.multinomial(prob_i, 1).item()
+            # top-k / top-p 필터링
+            if top_k is not None:
+                kth, _ = torch.topk(logit_i, top_k)
+                logit_i[logit_i < kth[-1]] = -float("inf")
+            if top_p is not None:
+                sorted_l, sorted_idx = torch.sort(logit_i, descending=True)
+                probs = F.softmax(sorted_l, dim=-1)
+                cum_p = probs.cumsum(dim=-1)
+                mask  = cum_p > top_p
+                mask[0] = False
+                sorted_l[mask] = -float("inf")
+                logit_i.scatter_(0, sorted_idx, sorted_l)
+
+            probs_i = F.softmax(logit_i, dim=-1)
+            tok     = torch.multinomial(probs_i, 1).item()
 
             generated[i].append(tok)
-            next_tok_list.append(tok)
+            next_tok.append(tok)
 
             if tok == end_token:
                 finished[i] = True
 
-        # 모든 시퀀스가 끝났으면 조기 종료
         if all(finished):
             break
 
-        # 다음 스텝 입력 토큰 업데이트
-        cur_tok = torch.tensor(next_tok_list, dtype=torch.long, device=device)
+    # ── 4) 후처리 : 패딩 길이 맞추기 (선택) ─────────────────────────
+    if pad_token is not None:
+        final_len = max(len(seq) for seq in generated)
+        generated = [
+            seq + [pad_token] * (final_len - len(seq)) for seq in generated
+        ]
 
     return generated
 
 @torch.no_grad()
 def generate_batch_sequence_LSTM_MHA(
     model,
-    z, *,                        # z  말고는 전부 키워드 전용!
-    max_length      = 42,
-    start_token     = None,
-    end_token       = None,
-    pad_token       = None,
+    z,                                 # z 외에는 전부 키워드 전용
+    max_length: int,
+    start_token: int,
+    end_token: int,
+    pad_token: int,
     grammar_mask_fn = None,
     index_to_token  = None,
-    device          = "cuda",
-    return_tensor   = False,     # True → [B,L_max] LongTensor 로 리턴
+    temperature: float   = 1.0,
+    top_k: int | None    = None,
+    top_p: float | None  = None,
+    device: str          = "cuda",
+    return_tensor: bool  = False,
 ):
     """
-    Autoregressive generation for the LSTM-MHA decoder.
+    LSTM-MHA 디코더용 배치 생성 (시퀀스 누적 방식)
 
-    z shape:
-        • [B, latent_dim]            → 그대로 사용
-        • [B, L_seq, latent_dim]     → dim=1 평균을 내서 사용
+    - hidden state 를 이어받으면서도, 매 스텝마다
+      지금까지 만든 시퀀스 전체(패딩 포함)를 디코더에 넣습니다.
+    - top-k, top-p, temperature 조절 지원.
     """
-    model  = model.to(device).eval()
 
-    # ─── 0. z 전처리 ──────────────────────────────────────────────
-    if z.dim() == 3:                         # [B, L, z]
-        z_vec = z.mean(dim=1)                # [B, z]
-    elif z.dim() == 2:                       # [B, z]
+    model = model.to(device).eval()
+
+    # ── 0. z 전처리 ──────────────────────────────────────────────
+    if z.dim() == 3:                      # [B,L,z] 이면 평균
+        z_vec = z.mean(1)
+    elif z.dim() == 2:                    # [B,z]
         z_vec = z
     else:
         raise ValueError("z must be [B,z] or [B,L,z]")
 
-    B = z_vec.size(0)
+    B     = z_vec.size(0)
     z_vec = z_vec.to(device)
 
-    # ─── 1. (h0,c0) 초기화 ───────────────────────────────────────
+    # ── 1. (h0,c0) 초기화 ───────────────────────────────────────
     h0_raw, c0_raw = torch.tanh(model.to_decoder(z_vec)).chunk(2, dim=-1)
-    num_layers     = model.decoder.num_layers
-    h = h0_raw.unsqueeze(0).repeat(num_layers, 1, 1).contiguous()
-    c = c0_raw.unsqueeze(0).repeat(num_layers, 1, 1).contiguous()
+    n_layers       = model.decoder.num_layers
+    h = h0_raw.unsqueeze(0).repeat(n_layers, 1, 1).contiguous()
+    c = c0_raw.unsqueeze(0).repeat(n_layers, 1, 1).contiguous()
 
-    # ─── 2. <SOS> 시작 ───────────────────────────────────────────
+    # ── 2. 시퀀스 시작 ───────────────────────────────────────────
     generated = [[start_token] for _ in range(B)]
-    cur_tok   = torch.full((B,), start_token, dtype=torch.long, device=device)
     finished  = [False] * B
 
-    # ─── 3. 한 토큰씩 생성 루프 ──────────────────────────────────
-    for _ in range(max_length - 1):          # <SOS> 포함했으므로 -1
-        emb = model.smiles_embbed(cur_tok).unsqueeze(1)          # [B,1,E]
-        out, (h, c) = model.decoder(emb, (h, c))                 # [B,1,E]
-        logits = model.predict(out.squeeze(1))                   # [B,V]
+    # ── 3. 오토리그레시브 루프 ──────────────────────────────────
+    for _ in range(max_length - 1):            # <SOS> 포함했으니 −1
+        # (a) 오른쪽-패딩 텐서화
+        cur_len = max(len(seq) for seq in generated)
+        seq_tensor = torch.full(
+            (B, cur_len), pad_token, dtype=torch.long, device=device
+        )
+        for i, seq in enumerate(generated):
+            seq_tensor[i, : len(seq)] = torch.tensor(seq, device=device)
+
+        # (b) 임베딩 → 디코더
+        emb = model.smiles_embbed(seq_tensor)         # [B,cur_len,E]
+        out, (h, c) = model.decoder(emb, (h, c))      # hidden 이어받음
+        logits = model.predict(out[:, -1]) / temperature   # [B,V] (마지막 토큰)
 
         next_tok = []
         for i in range(B):
             if finished[i]:
-                next_tok.append(pad_token if pad_token is not None else end_token)
+                next_tok.append(pad_token)
                 continue
 
             log_i = logits[i]
+
+            # grammar mask(선택)
             if grammar_mask_fn is not None:
-                mask = grammar_mask_fn(generated[i], index_to_token, log_i.size(0)).to(device)
+                mask = grammar_mask_fn(
+                    generated[i], index_to_token, log_i.size(0)
+                ).to(device)
                 log_i = log_i.masked_fill(~mask, -1e9)
 
-            prob_i = F.softmax(log_i, dim=-1)
-            tok_i  = torch.multinomial(prob_i, 1).item()
+            # top-k / top-p 필터링
+            if top_k is not None:
+                kth, _ = torch.topk(log_i, top_k)
+                log_i[log_i < kth[-1]] = -float("inf")
+            if top_p is not None:
+                sorted_l, sorted_idx = torch.sort(log_i, descending=True)
+                probs = F.softmax(sorted_l, dim=-1)
+                cum_p = probs.cumsum(dim=-1)
+                mask = cum_p > top_p
+                mask[0] = False
+                sorted_l[mask] = -float("inf")
+                log_i.scatter_(0, sorted_idx, sorted_l)
 
-            generated[i].append(tok_i)
-            next_tok.append(tok_i)
-            if tok_i == end_token:
+            tok = torch.multinomial(F.softmax(log_i, dim=-1), 1).item()
+            generated[i].append(tok)
+            next_tok.append(tok)
+
+            if tok == end_token:
                 finished[i] = True
 
         if all(finished):
             break
 
-        cur_tok = torch.tensor(next_tok, dtype=torch.long, device=device)
-
-    # ─── 4. 결과 반환 ────────────────────────────────────────────
+    # ── 4. 결과 반환 ────────────────────────────────────────────
     if return_tensor:
-        if pad_token is None:
-            raise ValueError("pad_token must be provided if return_tensor=True")
         return pad_sequence(
-            [torch.tensor(seq, dtype=torch.long, device=device) for seq in generated],
-            batch_first=True, padding_value=pad_token
+            [torch.tensor(seq, device=device) for seq in generated],
+            batch_first=True,
+            padding_value=pad_token,
         )
     return generated
-
