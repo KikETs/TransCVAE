@@ -34,7 +34,7 @@ class CVAE(nn.Module):
             nn.Linear(d_model // 2, d_model),
             nn.GELU()
         )
-        self.smiles_embbed = nn.Embedding(dataset.vocab_size, d_model)
+        self.smiles_embbed = nn.Embedding(dataset.vocab_size, d_model, padding_idx=dataset.vocab['[PAD]'])
         self.norm1 = nn.LayerNorm(latent_dim)
         self.crossattn = MultiHeadAttention(d_model=latent_dim)
         self.alpha = nn.Parameter(torch.ones(1))
@@ -51,59 +51,79 @@ class CVAE(nn.Module):
     
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var).to(device)
-        eps = torch.rand_like(std).to(device)
+        eps = torch.randn_like(std).to(device)
         return mu + eps * std
 
     def forward(
         self,
-        smiles_enc: torch.Tensor,   # [B,L]   (<cond>+SMILES)
-        smiles_tgt: torch.Tensor,   # [B,L]   (<SOS>+SMILES[:-1])
+        smiles_enc: torch.Tensor,   # [B,L_enc]  (<cond>+SMILES)
+        smiles_tgt: torch.Tensor,   # [B,L_out]  (타깃 길이: 손실 정렬용)
         properties: torch.Tensor,   # [B,3,1]
-        tf_ratio: float = 1.0       # 1.0=GT  0.0=self-sampling
+        mode: str = "gumbel",       # "gumbel" | "greedy"
+        tau: float = 1.0            # gumbel-softmax 온도
     ):
-        B, L = smiles_tgt.shape
+        """
+        GT 분기 없이 오직 Pred(자기회귀)만 사용.
+        mode="gumbel": Straight-Through Gumbel-Softmax로 미분 가능(권장, 학습용)
+        mode="greedy": argmax 샘플링(추론용, 비미분)
+        """
+        device = smiles_enc.device
+        B, L_out = smiles_tgt.shape
+        SOS = dataset.vocab['[SOS]']
 
-        # ─── 1. Encoder ────────────────────────────────────────────
-        emb_enc  = self.smiles_embbed(smiles_enc)                 # [B,L,E]
-        prop_e   = self.input_embedding(properties)               # [B,3,E]
-        enc_in   = torch.cat((emb_enc, prop_e), dim=1)           # [B,L+3,E]
-        enc_out  = self.encoder(enc_in)[0]                        # [B,L+3,E]
+        # ─── 1) Encoder ───────────────────────────────────────────────
+        emb_enc  = self.smiles_embbed(smiles_enc)               # [B,L_enc,E]
+        prop_e   = self.input_embedding(properties)             # [B,3,E]
+        enc_in   = torch.cat((emb_enc, prop_e), dim=1)          # [B,L_enc+3,E]
+        enc_out  = self.encoder(enc_in)[0]                      # [B,L_enc+3,E]
 
-        mu, lv   = self.to_means(enc_out), self.to_var(enc_out)   # [B,L,z]
-        z_sample = self.reparameterize(mu, lv)                    # [B,L,z]
+        mu, lv   = self.to_means(enc_out), self.to_var(enc_out) # [B,L_enc+3,z]
+        z_sample = self.reparameterize(mu, lv)                  # [B,L_enc+3,z]
 
-        # ─── 2. Cross-Attention + FFN on z ─────────────────────────
-        prop_p   = self.input_embedding_p(properties)             # [B,1,E′]
+        # ─── 2) Cross-Attention + FFN on z ───────────────────────────
+        prop_p   = self.input_embedding_p(properties)           # [B,1,z]
+        z_z      = self.alpha * self.crossattn.forward(z_sample, prop_p, prop_p) + z_sample
+        z_ff     = self.norm1(self.ff(z_z) + z_z)
 
-        z_z = self.alpha*self.crossattn(z_sample, prop_p, prop_p) + z_sample
-        z_ff = self.norm1(self.ff(z_z) + z_z)
+        # ─── 3) 초기 (h0,c0) 생성 ────────────────────────────────────
+        z_mean   = z_ff.mean(1)                                 # [B,z]
+        h0, c0   = torch.tanh(self.to_decoder(z_mean)).chunk(2, dim=-1)
+        h0, c0   = h0.unsqueeze(0).repeat(2,1,1), c0.unsqueeze(0).repeat(2,1,1)
 
-        # ─── 3. 초기 (h0,c0)  — z_mean → 2*E  ─────────────────────
-        z_mean   = z_ff.mean(1)                                   # [B,z]
-        h0c0     = torch.tanh(self.to_decoder(z_mean)).chunk(2, dim=-1)
-        h0, c0   = h0c0[0].unsqueeze(0).repeat(2,1,1), h0c0[1].unsqueeze(0).repeat(2,1,1)
+        # ─── 4) 자기회귀 디코딩(오직 Pred) ──────────────────────────
+        # 시작 토큰: SOS
+        x_t = torch.full((B, 1), SOS, dtype=torch.long, device=device)   # [B,1]
+        emb_t = self.smiles_embbed(x_t)                                  # [B,1,E]
 
-        # ─── 4. Teacher-forcing mix  (GT vs Pred) ─────────────────
-        emb_gt   = self.smiles_embbed(smiles_tgt)                 # [B,L,E]
-        if tf_ratio < 1.0:
-            with torch.no_grad():
-                logits_tf, _ = self.decoder(emb_gt, (h0,c0))      # 예비 pass
-            tok_pred  = logits_tf.argmax(-1)                      # [B,L]
-            tok_pred = tok_pred.clamp(max=dataset.vocab_size-1)
-            emb_pred  = self.smiles_embbed(tok_pred)              # [B,L,E]
+        logits_list = []
+        h, c = h0, c0
 
-            mask      = (torch.rand_like(smiles_tgt.float()) > tf_ratio).unsqueeze(-1)
-            emb_in    = torch.where(mask, emb_pred, emb_gt)       # 혼합 임베딩
-        else:
-            emb_in    = emb_gt
+        # Embedding weight (Gumbel-ST용)
+        emb_weight = self.smiles_embbed.weight                           # [V,E]
 
-        # ─── 5. Decoder (진짜 forward) ────────────────────────────
-        dec_out, _ = self.decoder(emb_in, (h0, c0))               # [B,L,E]
-        logits     = self.predict(dec_out)                        # [B,L,V]
+        for t in range(L_out):
+            dec_out_t, (h, c) = self.decoder(emb_t, (h, c))              # [B,1,E]
+            logit_t = self.predict(dec_out_t.squeeze(1))                 # [B,V]
+            logits_list.append(logit_t.unsqueeze(1))                     # 수집
 
-        # ─── 6. property-heads (그대로) ───────────────────────────
-        tgt_mu = self.to_prop(mu.view(-1, self.len*self.latent_dim))
-        tgt_z = self.to_prop_z(z_sample.view(-1, self.len*self.latent_dim))
+            if mode == "gumbel":
+                # Straight-Through Gumbel-Softmax (미분 가능)
+                y = F.gumbel_softmax(logit_t, tau=tau, hard=True)        # [B,V]
+                emb_next = torch.matmul(y, emb_weight)                   # [B,E]
+                emb_t = emb_next.unsqueeze(1)                            # [B,1,E]
+            elif mode == "greedy":
+                with torch.no_grad():
+                    idx = logit_t.argmax(-1)                             # [B]
+                emb_t = self.smiles_embbed(idx).detach().unsqueeze(1)    # [B,1,E]
+            else:
+                raise ValueError("mode must be 'gumbel' or 'greedy'.")
+
+        logits = torch.cat(logits_list, dim=1)                           # [B,L_out,V]
+
+        # ─── 5) property-heads ───────────────────────────────────────
+        B_, L_encp, Z = mu.shape
+        tgt_mu = self.to_prop(mu.reshape(B_, L_encp * Z))
+        tgt_z  = self.to_prop_z(z_sample.reshape(B_, L_encp * Z))
 
         return logits, tgt_mu, mu, lv, tgt_z
 

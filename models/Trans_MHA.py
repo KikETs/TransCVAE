@@ -61,9 +61,10 @@ class CVAE(nn.Module):
     def forward(self, smiles_enc, smiles_dec_input, properties, enc_smi_mask=None, dec_smi_mask=None):
         properties_e = self.input_embedding(properties)
         properties_p = self.input_embedding_p(properties)
-
-        encoded = self.encoder(smiles_enc, properties_e, enc_smi_mask)
-
+        if enc_smi_mask is not None:
+            encoded = self.encoder(smiles_enc, properties_e, enc_smi_mask)
+        else:
+            encoded = self.encoder(smiles_enc, properties_e)
         means = self.to_means(encoded)
         log_var = self.to_var(encoded).clamp_(max=0)
         q = Normal(means, torch.exp(0.5 * log_var))
@@ -75,8 +76,10 @@ class CVAE(nn.Module):
 
         tgt = self.to_prop(means.view(-1, self.max_len * self.latent_dim))
         tgt_z = self.to_prop_z(z.view(-1, self.max_len * self.latent_dim))
-        output = self.decoder(smiles_dec_input, z_z, enc_smi_mask)
-        
+        if dec_smi_mask is not None:
+            output = self.decoder(smiles_dec_input, z_z, enc_smi_mask, dec_smi_mask)
+        else:
+            output = self.decoder(smiles_dec_input, z_z)
 
         output = self.predict(output)
 

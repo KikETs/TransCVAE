@@ -474,47 +474,87 @@ def reconstruct_zmu(model, dataloader, vocab: dict, *,
 
 def eval_iwae_bound(model, prior, sm_enc, sm_dec_in, sm_dec_out, prop, smi_mask, K=64, chunk=8):
     model.eval()
-    # 1) build q,p
-    enc = model.encoder(sm_enc, model.input_embedding(prop), smi_mask)
-    mu_q, lv_q = model.to_means(enc), model.to_var(enc)
+    B = sm_enc.size(0)
+
+    # 1) q, p 구축
+    enc = model.encoder(sm_enc, model.input_embedding(prop), smi_mask)  # enc: [B, L, *]
+    mu_q, lv_q = model.to_means(enc), model.to_var(enc)                 # [B, L, D]
     q = Normal(mu_q, (0.5 * lv_q).exp())
 
-    mu_p, lv_p = prior(prop.squeeze())
+    mu_p, lv_p = prior(prop.squeeze())                                  # [B,L,D] or [B,D]
+    if mu_p.dim() == 2:
+        L = mu_q.size(1)
+        mu_p = mu_p.unsqueeze(1).expand(-1, L, -1)
+        lv_p = lv_p.unsqueeze(1).expand(-1, L, -1)
     p = Normal(mu_p, (0.5 * lv_p).exp())
 
-    # 2) chunked sampling
+    # 2) 유효 토큰 마스크 (KL용) — 기존 방식 그대로 유지
+    valid_mask = (sm_enc != PAD_IDX)
+    valid_mask = torch.cat([valid_mask, torch.ones([B, 3]).to(device)], dim=1).float()
+    mask4 = valid_mask.unsqueeze(0).unsqueeze(-1)           # [1,B,L,1]
+
+    # 길이 정규화를 위한 디코더 유효 길이(배치별) — 마스킹 로직은 건드리지 않음
+    L_eff_B = (sm_dec_out != PAD_IDX).sum(-1).clamp_min(1)  # [B]
+    # 브로드캐스트용 shape 맞추기
+    L_eff_B = L_eff_B.unsqueeze(0)                          # [1,B]
+
     log_ws = []
-    B = sm_enc.size(0)
+    log_ws_len = []      # length-normalized용
+    log_ws_latent = []   # latent-only용
+
     for k0 in range(0, K, chunk):
         k = min(chunk, K - k0)
-        z = q.rsample((k,))                             # [k,B,L,D]
-        z2 = z.view(k * B, *z.shape[2:])
 
-        # log p(x|z)
-        logits = model.predict(model.decoder(sm_dec_in.repeat(k,1), z2))
+        # --- z 샘플
+        z = q.rsample((k,))                                 # [k,B,L,D]
+        z2 = z.reshape(k * B, *z.shape[2:])                 # [kB,L,D]
+
+        # --- log p(x|z)
+        logits = model.predict(model.decoder(sm_dec_in.repeat(k, 1), z2))
         logp   = torch.log_softmax(logits, dim=-1)
-        ll     = logp.gather(-1,
-                    sm_dec_out.repeat(k,1).unsqueeze(-1)
-                 ).squeeze(-1)
-        ll.masked_fill_(sm_dec_out.repeat(k,1)==dataset.vocab['[PAD]'], 0.)
-        log_px = ll.sum(-1).view(k, B)                  # [k,B]
+        tgt    = sm_dec_out.repeat(k, 1)
+        ll     = logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [kB,L_dec]
+        ll.masked_fill_(tgt == PAD_IDX, 0.)
+        log_px = ll.sum(-1).view(k, B)                            # [k,B]
 
-        # log p(z), log q(z|x)
-        rd = tuple(range(2, z.dim()))
-        log_qz = q.log_prob(z).sum(rd)                  # [k,B]
-        log_pz = p.log_prob(z).sum(rd)                  # [k,B]
+        # --- log p(z), log q(z|x)  (PAD 마스크 적용: 기존 유지)
+        log_qz = (q.log_prob(z) * mask4).sum((2, 3))             # [k,B]
+        log_pz = p.log_prob(z).sum((2, 3))                       # [k,B]
 
-        log_ws.append(log_px + log_pz - log_qz)         # <— no β, no clamp
+        # 원래 IWAE 가중치 (그대로)
+        log_ws.append(log_px + log_pz - log_qz)
 
-    log_ws = torch.cat(log_ws, 0).double()                       # (K,B)
+        # Length-normalized IWAE 가중치 (per-token 진단용)
+        log_px_norm = log_px / L_eff_B.to(log_px.dtype)          # [k,B]
+        log_ws_len.append(log_px_norm + log_pz - log_qz)
 
-    # 3) IWAE bound
-    m    = log_ws.max(0, keepdim=True).values          # (1,B)
-    iwae = (m + (log_ws - m).exp().mean(0).log()).squeeze(0)  # (B,)
+        # Latent-only 가중치 (likelihood 제외, 잠재 쪽 진단용)
+        log_ws_latent.append(log_pz - log_qz)
 
-    # 4) ESS
+    # 텐서 합치기
+    log_ws        = torch.cat(log_ws,        0).double()   # [K,B]
+    log_ws_len    = torch.cat(log_ws_len,    0).double()   # [K,B]
+    log_ws_latent = torch.cat(log_ws_latent, 0).double()   # [K,B]
+
+    # --- IWAE bound (원래)
+    m = log_ws.max(0, keepdim=True).values
+    iwae = (m + (log_ws - m).exp().mean(0).log()).squeeze(0)   # [B]
+
+    # --- ESS (원래)
     w = (log_ws - m).exp()
     w = w / w.sum(0, keepdim=True)
     ess = (w.sum(0)**2 / (w**2).sum(0)).mean().item()
 
-    return iwae.mean().item(), ess
+    # --- Length-normalized ESS
+    m_len = log_ws_len.max(0, keepdim=True).values
+    w_len = (log_ws_len - m_len).exp()
+    w_len = w_len / w_len.sum(0, keepdim=True)
+    ess_len = (w_len.sum(0)**2 / (w_len**2).sum(0)).mean().item()
+
+    # --- Latent-only ESS
+    m_lat = log_ws_latent.max(0, keepdim=True).values
+    w_lat = (log_ws_latent - m_lat).exp()
+    w_lat = w_lat / w_lat.sum(0, keepdim=True)
+    ess_latent = (w_lat.sum(0)**2 / (w_lat**2).sum(0)).mean().item()
+
+    return iwae.mean().item(), ess, ess_len, ess_latent

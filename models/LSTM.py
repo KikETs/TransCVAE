@@ -35,65 +35,82 @@ class CVAE(nn.Module):
             nn.Linear(d_model // 2, d_model),
             nn.GELU()
         )
-        self.smiles_embbed = nn.Embedding(dataset.vocab_size, d_model)
+        self.smiles_embbed = nn.Embedding(dataset.vocab_size, d_model, padding_idx=dataset.vocab['[PAD]'])
     
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var).to(device)
-        eps = torch.rand_like(std).to(device)
+        eps = torch.randn_like(std).to(device)
         return mu + eps * std
 
-    def forward(self, smiles_enc, smiles_tgt, properties, tf_ratio: float = 1.0):
+    def forward(
+        self,
+        smiles_enc: torch.Tensor,   # [B, L_enc]  (<cond>+SMILES)
+        smiles_tgt: torch.Tensor,   # [B, L_out]  (손실 정렬 길이)
+        properties: torch.Tensor,   # [B, 3, 1] 또는 [B,3]
+        mode: str = "gumbel",       # "gumbel" | "greedy"
+        tau: float = 1.0            # Gumbel-Softmax 온도
+    ):
         """
-        smiles_enc : [B, L]   - encoder 입력  (<cond> + SMILES)
-        smiles_tgt : [B, L]   - teacher-forcing target  (<SOS>+SMILES[:-1])
-        properties : [B, 3]
-        tf_ratio   : 0.0~1.0  - teacher-forcing 비율
+        GT 분기(teacher-forcing) 없이 오직 Pred(자기회귀)만 사용.
+        mode="gumbel": Straight-Through Gumbel-Softmax (학습 권장, 미분 가능)
+        mode="greedy": argmax 샘플링 (추론용, 비미분)
         """
-        # -------------------------------------------------------
-        # 2) Encoder  (μ, σ 계산용 마지막 hidden-state)
-        # -------------------------------------------------------
-        prop_emb  = self.input_embedding(properties)          # [B, d]
-        emb_src   = self.smiles_embbed(smiles_enc)            # [B,L,d]
-        enc_in    = torch.cat([emb_src,prop_emb], dim=1)  # [B,L+3,d]
-        h_enc     = self.encoder(enc_in)[1][0][-1]            # [B,d_model]  (h_N)
+        device = smiles_enc.device
+        B, L_out = smiles_tgt.shape
+        SOS = dataset.vocab['[SOS]']
 
-        mu, logv  = self.to_means(h_enc), self.to_var(h_enc)  # [B,z]
-        z         = self.reparameterize(mu, logv)             # [B,z]
+        # properties 형상 보정: [B,3] -> [B,3,1]
+        if properties.dim() == 2:
+            properties = properties.unsqueeze(-1)
 
-        # -------------------------------------------------------
-        # 3) z → 초기 hidden (h0,c0)
-        # -------------------------------------------------------
-        h0c0      = torch.tanh(self.to_decoder(z)).chunk(2, dim=-1)
-        h0, c0    = h0c0[0].unsqueeze(0).repeat(2,1,1), h0c0[1].unsqueeze(0).repeat(2,1,1)
+        # ── 1) Encoder ─────────────────────────────────────────────
+        emb_src = self.smiles_embbed(smiles_enc)          # [B, L_enc, d_model]
+        prop_emb = self.input_embedding(properties)       # [B, 3,     d_model]
+        enc_in = torch.cat([emb_src, prop_emb], dim=1)    # [B, L_enc+3, d_model]
 
-        # -------------------------------------------------------
-        # 4) teacher-forcing mix
-        # -------------------------------------------------------
-        emb_gt    = self.smiles_embbed(smiles_tgt)            # ground-truth embedding
-        if tf_ratio < 1.0:                                    # scheduled sampling
-            with torch.no_grad():
-                logits_tf, _ = self.decoder(emb_gt, (h0,c0))
-            emb_pred =logits_tf.argmax(-1)   # model tokens
-            emb_pred = emb_pred.clamp(max=dataset.vocab_size-1)
-            emb_pred = self.smiles_embbed(emb_pred)
-            take_pred= (torch.rand_like(smiles_tgt.float()) > tf_ratio).unsqueeze(-1)
-            emb_in   = torch.where(take_pred, emb_pred, emb_gt)   # GT ↔ Pred 혼합
-        else:
-            emb_in   = emb_gt
+        # 마지막 hidden state로 μ, logσ² 계산
+        h_enc = self.encoder(enc_in)[1][0][-1]            # [B, d_model]
+        mu, logv = self.to_means(h_enc), self.to_var(h_enc)  # [B, z]
+        z = self.reparameterize(mu, logv)                 # [B, z]
 
-        # -------------------------------------------------------
-        # 5) Decoder   (진짜 forward)
-        # -------------------------------------------------------
-        out, _    = self.decoder(emb_in, (h0, c0))
-        logits    = self.predict(out)                         # [B,L,V]
+        # z → (h0, c0)
+        h0, c0 = torch.tanh(self.to_decoder(z)).chunk(2, dim=-1)  # [B, d_model] x2
+        h0 = h0.unsqueeze(0).repeat(self.decoder.num_layers, 1, 1)  # [num_layers, B, d_model]
+        c0 = c0.unsqueeze(0).repeat(self.decoder.num_layers, 1, 1)
 
-        # -------------------------------------------------------
-        # 6) property-heads 그대로 유지
-        # -------------------------------------------------------
-        tgt_mu    = self.to_prop(mu)                         # [B,3]
-        tgt_z     = self.to_prop_z(z)                         # [B,3]
+        # ── 2) 자기회귀 디코딩(오직 Pred) ─────────────────────────
+        x_t = torch.full((B, 1), SOS, dtype=torch.long, device=device)  # [B,1]
+        emb_t = self.smiles_embbed(x_t)                                  # [B,1,d_model]
+
+        logits_list = []
+        h, c = h0, c0
+        emb_weight = self.smiles_embbed.weight                           # [V, d_model]
+
+        for t in range(L_out):
+            dec_out_t, (h, c) = self.decoder(emb_t, (h, c))              # [B,1,d_model]
+            logit_t = self.predict(dec_out_t.squeeze(1))                 # [B,V]
+            logits_list.append(logit_t.unsqueeze(1))                     # [B,1,V]
+
+            if mode == "gumbel":
+                # Straight-Through Gumbel-Softmax (미분 가능)
+                y = F.gumbel_softmax(logit_t, tau=tau, hard=True)        # [B,V]
+                emb_next = y @ emb_weight                                # [B,d_model]
+                emb_t = emb_next.unsqueeze(1)                            # [B,1,d_model]
+            elif mode == "greedy":
+                with torch.no_grad():
+                    idx = logit_t.argmax(-1)                             # [B]
+                emb_t = self.smiles_embbed(idx).detach().unsqueeze(1)    # [B,1,d_model]
+            else:
+                raise ValueError("mode must be 'gumbel' or 'greedy'.")
+
+        logits = torch.cat(logits_list, dim=1)                           # [B, L_out, V]
+
+        # ── 3) property heads (기존 정의 그대로) ───────────────────
+        tgt_mu = self.to_prop(mu)        # [B, 3]
+        tgt_z  = self.to_prop_z(z)       # [B, 3]
 
         return logits, tgt_mu, mu, logv, tgt_z
+
 
 class PriorNet(nn.Module):
     """

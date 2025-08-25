@@ -22,20 +22,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.manifold import TSNE
 from matplotlib.colors import ListedColormap
 import umap.umap_ as umap
-from group_selfies.group_decoder import (
-    _tokenize_selfies, Counter,
-    selfies_to_graph_iterative, form_rings_bilocally_iterative
-)
-from group_selfies import(
-    fragment_mols,
-    Group,
-    MolecularGraph,
-    GroupGrammar,
-    group_encoder
-)
-from group_selfies.utils.selfies_utils import split_selfies
+import re
+import selfies_psmiles as sfp
 from rdkit.Chem import rdmolops
-import selfies as sf   # polyselfies가 selfies를 패치해 설치해 줌
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -46,55 +35,54 @@ log_minmax_pipeline = Pipeline(steps=[
     ('minmax', MinMaxScaler())
 ])
 
-ess = GroupGrammar.essential_set()
 
-def decode_keep_star(grammar, selfies, sanitize=False, verbose=False):
+def decode_keep_star(selfies_str: str, sanitize: bool = False, verbose: bool = True):
     """
-    Group SELFIES → RDKit Mol, but KEEP '*' dummy atoms (do not H-cap).
+    SELFIES → RDKit Mol, but KEEP '*' dummy atoms (do not add H or rewrite).
+    - sf.decoder(selfies) 로 SMILES를 얻고,
+    - RDKit으로 파싱하되 sanitize=False로 별표 보존.
     """
-    rings = []
-    place_from_idx = {}
-    inverse_place = []
-    dummy_counter = Counter(1)
-    group_atom = {}
+    # 1) SELFIES → SMILES (패치된 sf.decoder는 [*] 포함 SMILES 반환)
+    
+    smiles = sfp.decoder_psmiles(selfies_str)
+    if verbose:
+        print(f"[decode_keep_star] SELFIES: {selfies_str}")
+        print(f"[decode_keep_star] SMILES : {smiles}")
 
-    mol = selfies_to_graph_iterative(
-        grammar=grammar,
-        symbol_iter=_tokenize_selfies(selfies),
-        selfies=selfies,
-        rings=rings,
-        dummy_counter=dummy_counter,
-        place_from_idx=place_from_idx,
-        inverse_place=inverse_place,
-        verbose=verbose,
-        group_atom=group_atom,
-    )
-    form_rings_bilocally_iterative(
-        mol, rings, place_from_idx, inverse_place,
-        dummy_counter, group_atom, verbose=verbose
-    )
+    # 2) RDKit Mol (sanitize=False로 원형 보존; '*' 유지)
+    mol = Chem.MolFromSmiles(smiles, sanitize=False)
+    if mol is None:
+        raise ValueError(f"Failed to parse SMILES: {smiles}")
 
-    res = mol.GetMol()  # convert RWMol→Mol
+    # 요청 시, 아주 완화된 sanitize만 수행(필요 없으면 생략 가능)
     if sanitize:
-        # 기본 Sanitize는 '*'에도 대체로 안전하지만 필요시 제약 완화
-        Chem.SanitizeMol(res, sanitizeOps=Chem.SanitizeFlags.SANITIZE_NONE)
-    return res
+        Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_NONE)
+
+    return mol
 
 def tok_ids_to_smiles(tok_ids, id2tok):
-    tokens = [id2tok[i] for i in tok_ids]   
+    """
+    토큰 ID 시퀀스 → SELFIES 문자열 → SMILES
+    - [EOS] 앞까지만 사용
+    - sf.decoder 로 디코드
+    - PSMILES canonicalize 시도 (실패하면 원본 유지)
+    """
+    tokens = [id2tok[i] for i in tok_ids]
     if "[EOS]" in tokens:
         tokens = tokens[:tokens.index("[EOS]")]
     sf_str = "".join(tokens)
-
     try:
-        smiles = decode_keep_star(ess, sf_str)
-        smiles = Chem.MolToSmiles(smiles)
+        # SELFIES -> RDKit Mol (별표 유지), -> canonical SMILES
+        mol = decode_keep_star(sf_str, sanitize=False, verbose=True)
+        smiles = Chem.MolToSmiles(mol)
     except Exception:
         return None
 
     # 2) PSMILES canonicalize – 실패 시 원본 유지
     try:
+        # NOTE: 아래 PS(...)는 사용 중인 PSMILES canonicalizer의 API를 그대로 둔 것임.
         cand = PS(smiles).canonicalize.psmiles
+        # 별표 2개(양단) 조건과 RDKit 재파싱 검사
         if cand.count('*') == 2 and Chem.MolFromSmiles(cand):
             smiles = cand
     except Exception:

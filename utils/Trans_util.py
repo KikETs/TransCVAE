@@ -55,7 +55,7 @@ class TFEncoder(nn.Module):
     def __init__(self, d_model=256, n_heads=4, d_ff=64, enc_seq_len=5000, dropout=0.2):
         super().__init__()
         self.normLayer = LayerNorm(d_model=d_model)
-        self.smi_embed = nn.Embedding(dataset.vocab_size, d_model)
+        self.smi_embed = nn.Embedding(dataset.vocab_size, d_model, padding_idx=dataset.vocab['[PAD]'])
         self.encoderLayer = TransformerEncoderLayer(batch_first=True,
                                                d_model=d_model,
                                                nhead=n_heads,
@@ -95,7 +95,7 @@ class TFDecoder(nn.Module):
                                           norm=self.normLayer)        
         
         self.to_memory = nn.Linear(latent_dim, d_model)
-        self.smi_embed = nn.Embedding(dataset.vocab_size, d_model)
+        self.smi_embed = nn.Embedding(dataset.vocab_size, d_model, padding_idx=dataset.vocab['[PAD]'])
         self.d_model = d_model
         self.pe = PositionalEncoding(d_model, dropout=0.2, max_len=5000)
 

@@ -4,7 +4,14 @@ from pathlib import Path
 _THIS_FILE = Path(__file__).resolve()
 PROJECT_ROOT = _THIS_FILE.parent.parent
 sys.path.append(str(PROJECT_ROOT))
-ess = GroupGrammar.essential_set()
+
+def _psmiles_core(ps: str) -> str:
+    """{…}n / (… )n 형태의 PSMILES 래퍼 제거."""
+    s = ps.strip()
+    s = re.sub(r"^\{\s*(.+?)\s*\}\s*(\d+(?:-\d+)?)?$", r"\1", s)  # {…}n → …
+    s = re.sub(r"^\(\s*(.+?)\s*\)\s*(\d+(?:-\d+)?)?$", r"\1", s)  # (… )n → …
+    return s
+
 mm_scaler = MinMaxScaler()
 class load_data(Dataset):
     def __init__(self, csv_path, cache_dir="cache"):
@@ -65,8 +72,6 @@ class load_data(Dataset):
         print(self.SMILES_enc[0])
         print(self.SMILES_dec_input[0])
         print(self.SMILES_dec_output[0])
-    def split_selfies(self, sf_str):
-        return sf.split_selfies(sf_str)   # polyselfies가 내부 호출
 
     def _build_from_csv(self, path):
         #csv 읽기
@@ -101,12 +106,11 @@ class load_data(Dataset):
         print(self.properties[:,1].mean())
         print(self.properties[:,2].mean())
 
-        #PSMILES 변환        
+        #PSMILES 변환
+        
         psmiles = [PS(smiles).canonicalize.psmiles for smiles in self.SMILES]
-
-        gpselfies = [ess.full_encoder(Chem.MolFromSmiles(s)) for s in psmiles]
-
-        sf_tokens = [list(split_selfies(sf)) for sf in gpselfies]
+        pselfies = [sfp.encoder_psmiles(_psmiles_core(ps), strict=False) for ps in psmiles]
+        sf_tokens = [list(sfp.split_selfies(psf)) for psf in pselfies]
 
         self.max_len = max(len(t) for t in sf_tokens) + 1
 
@@ -156,7 +160,7 @@ class load_data(Dataset):
 
         self.test_data = self.SMILES_enc[50]
 
-        print("PSMILES : ", gpselfies[50])
+        print("PSMILES : ", pselfies[50])
         print("After AIS encoding : ", enc[50])
         print("After AIS Tokenization : ", enc[50])
         print("After to number : ", enc[50])
@@ -277,10 +281,8 @@ class load_data_LSTM(Dataset):
 
         #PSMILES 변환        
         psmiles = [PS(smiles).canonicalize.psmiles for smiles in self.SMILES]
-
-        gpselfies = [ess.full_encoder(Chem.MolFromSmiles(s)) for s in psmiles]
-
-        sf_tokens = [list(split_selfies(sf)) for sf in gpselfies]
+        pselfies = [sfp.encoder_psmiles(_psmiles_core(ps), strict=False) for ps in psmiles]
+        sf_tokens = [list(sfp.split_selfies(psf)) for psf in pselfies]
 
         self.max_len = max(len(t) for t in sf_tokens) + 1
 
@@ -331,7 +333,7 @@ class load_data_LSTM(Dataset):
 
         self.test_data = self.SMILES_enc[50]
 
-        print("PSMILES : ", gpselfies[50])
+        print("PSMILES : ", pselfies[50])
         print("After AIS encoding : ", enc[50])
         print("After AIS Tokenization : ", enc[50])
         print("After to number : ", enc[50])
