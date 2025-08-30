@@ -73,7 +73,7 @@ def tok_ids_to_smiles(tok_ids, id2tok):
     sf_str = "".join(tokens)
     try:
         # SELFIES -> RDKit Mol (별표 유지), -> canonical SMILES
-        mol = decode_keep_star(sf_str, sanitize=False, verbose=True)
+        mol = decode_keep_star(sf_str, sanitize=False, verbose=False)
         smiles = Chem.MolToSmiles(mol)
     except Exception:
         return None
